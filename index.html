@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude &amp; Co. — Studio HQ</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=Yellowtail&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%2326281f'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='%23f2b33d' font-family='Georgia' font-style='italic' font-weight='bold'>cl.</text></svg>">
+</head>
+<body>
+
+<!-- ======= ACCESS GATE ======= -->
+<div id="gate" class="gate hidden">
+  <div class="gate-card">
+    <div class="logo-mark">cl<span class="dot">.</span><span class="star">✳</span></div>
+    <h1>Claude &amp; Co.</h1>
+    <p class="gate-sub">Studio HQ — team access</p>
+    <input type="password" id="gate-input" placeholder="Studio password" autocomplete="off">
+    <button id="gate-btn" class="btn btn-gold">Come on in</button>
+    <p id="gate-err" class="gate-err hidden">That's not it — ask Alise for the password.</p>
+  </div>
+</div>
+
+<!-- ======= APP ======= -->
+<div id="app" class="hidden">
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="logo-mark small">cl<span class="dot">.</span><span class="star">✳</span></span>
+        <div class="brand-text">
+          <span class="brand-name">Claude &amp; Co.</span>
+          <span class="brand-tag">Studio HQ</span>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <select id="who" class="who-select" title="Who's looking?"></select>
+        <button id="owner-btn" class="btn btn-outline-light btn-sm">Owner login</button>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="today">Today</button>
+      <button class="tab" data-tab="clients">Clients</button>
+      <button class="tab" data-tab="team">Team</button>
+      <button class="tab" data-tab="schedule">Schedule</button>
+      <button class="tab" data-tab="links">Links</button>
+    </nav>
+  </header>
+
+  <div id="owner-bar" class="owner-bar hidden">
+    <span>✳ Owner mode — you can edit everything.</span>
+    <span class="owner-bar-actions">
+      <button id="publish-btn" class="btn btn-dark btn-sm">Publish to team</button>
+      <button id="settings-btn" class="btn btn-outline-dark btn-sm">Settings</button>
+      <button id="lock-btn" class="btn btn-outline-dark btn-sm">Lock</button>
+    </span>
+  </div>
+
+  <main class="wrap">
+    <section id="view-today" class="view"></section>
+    <section id="view-clients" class="view hidden"></section>
+    <section id="view-team" class="view hidden"></section>
+    <section id="view-schedule" class="view hidden"></section>
+    <section id="view-links" class="view hidden"></section>
+  </main>
+
+  <footer class="foot">
+    <span class="logo-mark tiny">cl<span class="dot">.</span></span>
+    Claude &amp; Co. LLC · made with love (and good light) ✳
+  </footer>
+</div>
+
+<!-- ======= MODAL ======= -->
+<div id="modal-backdrop" class="modal-backdrop hidden">
+  <div id="modal" class="modal"></div>
+</div>
+
+<script src="assets/data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
