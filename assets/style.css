@@ -282,6 +282,7 @@ button { font-family: inherit; }
 .pill.shoot { background: var(--pine); color: var(--pink); }
 .pill.timeoff { background: #e4eee2; color: var(--sage-deep); }
 .pill.requested { background: #fbe4e8; color: var(--rose-deep); }
+.pill.denied { background: #f1e7e6; color: var(--muted); text-decoration: line-through; }
 
 .avatar {
   display: inline-flex; align-items: center; justify-content: center;

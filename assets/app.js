@@ -88,6 +88,9 @@
     for (var i = 0; i < state.clients.length; i++) if (state.clients[i].id === id) return state.clients[i];
     return null;
   }
+  function statusLabel(s) {
+    return s === "archived" ? "past client" : s;
+  }
   function toast(msg) {
     var el = document.createElement("div");
     el.className = "toast";
@@ -152,8 +155,7 @@
   });
 
   // ---------- owner mode ----------
-  $("owner-btn").addEventListener("click", function () {
-    if (isOwner()) return;
+  function ownerLogin(onSuccess) {
     openModal(
       "<h3>Owner login</h3>" +
       '<label>PIN</label><input type="password" id="pin-in" inputmode="numeric" autocomplete="off">' +
@@ -168,6 +170,7 @@
         closeModal();
         toast("Owner mode on — edit away ✳");
         renderAll();
+        if (onSuccess) onSuccess();
       } else {
         input.value = "";
         input.placeholder = "Nope — try again";
@@ -175,6 +178,10 @@
     }
     $("pin-go").addEventListener("click", go);
     input.addEventListener("keydown", function (e) { if (e.key === "Enter") go(); });
+  }
+  $("owner-btn").addEventListener("click", function () {
+    if (isOwner()) return;
+    ownerLogin();
   });
   $("lock-btn").addEventListener("click", function () {
     sessionStorage.removeItem(SS_OWNER);
@@ -368,7 +375,7 @@
       '<div class="seg" id="cf-status">' +
         '<button data-s="active" class="' + (c.status === "active" ? "on" : "") + '">Active</button>' +
         '<button data-s="pending" class="' + (c.status === "pending" ? "on" : "") + '">Pending</button>' +
-        '<button data-s="archived" class="' + (c.status === "archived" ? "on" : "") + '">Archived</button>' +
+        '<button data-s="archived" class="' + (c.status === "archived" ? "on" : "") + '">Past client</button>' +
       "</div>" +
       "<label>Contact person</label>" + '<input type="text" id="cf-contact" value="' + esc(c.contact) + '">' +
       "<label>Email</label>" + '<input type="text" id="cf-email" value="' + esc(c.email) + '">' +
@@ -522,6 +529,8 @@
   function fmtRange(a, b) {
     return a === b || !b ? fmtDate(a) : fmtDate(a) + " – " + fmtDate(b);
   }
+  function b64e(s) { return btoa(unescape(encodeURIComponent(s))); }
+  function b64d(s) { return decodeURIComponent(escape(atob(s))); }
   function timeoffForm(entryId) {
     // Owner: add/edit directly (status approved). Employee: request → email.
     var owner = isOwner();
@@ -570,9 +579,13 @@
         closeModal();
         var m = member(who);
         var subject = "Time off request — " + (m ? m.full : "team");
+        var reqLink = location.origin + location.pathname + "?req=" +
+          encodeURIComponent(b64e(JSON.stringify({ m: who, s: start, e: end, r: e.reason })));
         var body = "Hi Alise!\n\nI'd like to request time off:\n\nFrom: " + fmtDate(start) +
           "\nThrough: " + fmtDate(end) +
-          (e.reason ? "\nReason: " + e.reason : "") + "\n\nThank you!\n" + (m ? m.name : "");
+          (e.reason ? "\nReason: " + e.reason : "") +
+          "\n\nApprove or deny it here:\n" + reqLink +
+          "\n\nThank you!\n" + (m ? m.name : "");
         window.location.href = "mailto:" + encodeURIComponent(state.settings.ownerEmail || "alise@claudeandco.design") +
           "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
         toast("Almost done — hit Send in the email that just opened ✉️");
@@ -597,9 +610,12 @@
       (m ? avatarHtml(m) : "") +
       '<span style="flex:1"><b>' + esc(m ? m.name : "?") + "</b> off " + fmtRange(e.start, e.end) +
       (e.reason ? ' <span style="color:var(--muted)">· ' + esc(e.reason) + "</span>" : "") + "</span>" +
-      '<span class="pill ' + (e.status === "approved" ? "timeoff" : "requested") + '">' + e.status + "</span>" +
+      '<span class="pill ' + (e.status === "approved" ? "timeoff" : e.status === "denied" ? "denied" : "requested") + '">' + e.status + "</span>" +
       (isOwner()
-        ? (e.status === "requested" ? '<button class="btn btn-dark btn-sm" data-to-approve="' + e.id + '">Approve</button>' : "") +
+        ? (e.status === "requested"
+            ? '<button class="btn btn-dark btn-sm" data-to-approve="' + e.id + '">Approve</button>' +
+              '<button class="btn btn-rust btn-sm" data-to-deny="' + e.id + '">Deny</button>'
+            : "") +
           '<button class="task-edit" data-to-edit="' + e.id + '" title="Edit">✎</button>'
         : "") +
       "</div>";
@@ -609,6 +625,12 @@
       b.addEventListener("click", function () {
         var e = state.timeoff.find(function (x) { return x.id === b.dataset.toApprove; });
         if (e) { e.status = "approved"; save(); toast("Approved 🌴"); renderAll(); }
+      });
+    });
+    root.querySelectorAll("[data-to-deny]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var e = state.timeoff.find(function (x) { return x.id === b.dataset.toDeny; });
+        if (e) { e.status = "denied"; save(); toast("Denied — let them know 💬"); renderAll(); }
       });
     });
     root.querySelectorAll("[data-to-edit]").forEach(function (b) {
@@ -724,7 +746,7 @@
     html += '<div class="client-grid">' + actives.map(clientCard).join("") + "</div>";
 
     if (archived.length) {
-      html += '<div class="section-label">Archived</div><div class="client-grid">' + archived.map(clientCard).join("") + "</div>";
+      html += '<div class="section-label">Past clients</div><div class="client-grid">' + archived.map(clientCard).join("") + "</div>";
     }
     v.innerHTML = html;
 
@@ -734,7 +756,7 @@
       return '<div class="card" data-client="' + c.id + '" style="cursor:pointer">' +
         '<div class="card-head"><div><h3 class="card-title">' + esc(c.name) + "</h3>" +
         '<div class="card-sub">' + esc(c.services || "") + "</div></div>" +
-        '<span class="pill ' + c.status + '">' + c.status + "</span></div>" +
+        '<span class="pill ' + c.status + '">' + statusLabel(c.status) + "</span></div>" +
         '<div class="meta-row"><span class="avatars">' + c.team.map(function (id) { return avatarHtml(member(id)); }).join("") + "</span> " +
         "&nbsp;" + open.length + " open task" + (open.length === 1 ? "" : "s") +
         (od ? ' · <span style="color:var(--rose-deep);font-weight:700">' + od + " overdue</span>" : "") + "</div>" +
@@ -756,7 +778,7 @@
     var done = list.filter(function (t) { return t.status === "done"; });
 
     var html = '<div class="card-head"><h3 style="margin:0;font-size:22px">' + esc(c.name) + "</h3>" +
-      '<span class="pill ' + c.status + '">' + c.status + "</span></div>";
+      '<span class="pill ' + c.status + '">' + statusLabel(c.status) + "</span></div>";
     if (c.contact) html += '<div class="meta-row"><b>Contact:</b> ' + esc(c.contact) + "</div>";
     if (c.email) html += '<div class="meta-row"><b>Email:</b> <a href="mailto:' + esc(c.email) + '">' + esc(c.email) + "</a></div>";
     if (c.phone) html += '<div class="meta-row"><b>Phone:</b> <a href="tel:' + esc(c.phone.replace(/[^0-9+]/g, "")) + '">' + esc(c.phone) + "</a></div>";
@@ -777,6 +799,10 @@
     html += '<div class="modal-actions">' +
       (isOwner() ? '<button class="btn btn-outline-dark" id="cd-edit">Edit client</button>' : "") +
       '<button class="btn btn-gold" data-close>Close</button></div>';
+    if (isOwner()) {
+      html += '<div class="danger-zone"><button class="btn-ghost" id="cd-archive">' +
+        (c.status === "archived" ? "🌱 Make active again" : "📁 Move to past clients") + "</button></div>";
+    }
 
     openModal(html);
     bindTaskButtons($("modal"));
@@ -784,6 +810,14 @@
     if (add) add.addEventListener("click", function () { taskForm(null, cid); });
     var ed = $("cd-edit");
     if (ed) ed.addEventListener("click", function () { clientForm(cid); });
+    var arch = $("cd-archive");
+    if (arch) arch.addEventListener("click", function () {
+      c.status = c.status === "archived" ? "active" : "archived";
+      save();
+      closeModal();
+      toast(c.status === "archived" ? c.name + " moved to past clients 📁" : c.name + " is active again 🌱");
+      renderAll();
+    });
     $("modal").querySelectorAll("[data-cycle]").forEach(function (b) {
       b.addEventListener("click", function () { setTimeout(function () { clientDetail(cid); }, 0); });
     });
@@ -984,6 +1018,53 @@
     });
   });
 
+  // ---------- incoming time-off request link (from the email) ----------
+  function handleRequestLink() {
+    var raw = new URLSearchParams(location.search).get("req");
+    if (!raw) return;
+    history.replaceState(null, "", location.pathname);
+    var req;
+    try { req = JSON.parse(b64d(raw)); } catch (err) { return; }
+    if (!req || !req.s) return;
+    var m = member(req.m);
+    var name = m ? m.full : "Someone";
+
+    function decide(approve) {
+      if (!isOwner()) { ownerLogin(function () { decide(approve); }); return; }
+      // If this exact request already exists (e.g. link opened twice), update it.
+      var existing = state.timeoff.find(function (x) {
+        return x.memberId === req.m && x.start === req.s && x.end === (req.e || req.s);
+      });
+      var entry = existing || { id: uid(), memberId: req.m, start: req.s, end: req.e || req.s, reason: req.r || "" };
+      entry.status = approve ? "approved" : "denied";
+      if (!existing) state.timeoff.push(entry);
+      save();
+      closeModal();
+      toast(approve ? "Approved 🌴 — it's on the schedule" : "Denied — let them know 💬");
+      activeTab = "team";
+      document.querySelectorAll("#tabs .tab").forEach(function (b) { b.classList.toggle("active", b.dataset.tab === "team"); });
+      ["today", "clients", "team", "schedule", "links"].forEach(function (v) {
+        $("view-" + v).classList.toggle("hidden", v !== "team");
+      });
+      renderAll();
+    }
+
+    openModal(
+      "<h3>🌴 Time off request</h3>" +
+      '<div class="timeoff-row"><span class="to-emoji">🌴</span>' + (m ? avatarHtml(m) : "") +
+      "<span style='flex:1'><b>" + esc(name) + "</b> asks for " + fmtRange(req.s, req.e || req.s) +
+      (req.r ? ' <span style="color:var(--muted)">· ' + esc(req.r) + "</span>" : "") + "</span></div>" +
+      "<p class='hint'>Approving puts it on the schedule for the whole team (after your next publish). You'll be asked for your PIN if Owner mode is off.</p>" +
+      '<div class="modal-actions">' +
+        '<button class="btn btn-rust" id="req-deny">Deny</button>' +
+        '<button class="btn btn-gold" id="req-approve">Approve 🌴</button>' +
+      "</div>" +
+      '<div class="danger-zone"><button class="btn-ghost" data-close>Decide later</button></div>'
+    );
+    $("req-approve").addEventListener("click", function () { decide(true); });
+    $("req-deny").addEventListener("click", function () { decide(false); });
+  }
+
   // ---------- boot ----------
   function renderAll() {
     renderOwnerUI();
@@ -997,4 +1078,5 @@
 
   checkGate();
   renderAll();
+  handleRequestLink();
 })();
