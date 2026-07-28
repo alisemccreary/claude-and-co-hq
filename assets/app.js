@@ -1,7 +1,9 @@
-/* Claude & Co. Studio HQ — app logic.
+/* Claude & Co. Studio HQ — app logic (v2).
    Plain JS, no dependencies. State lives in localStorage on each device;
    the shipped assets/data.js is the shared baseline for the whole team.
-   Owner mode (PIN) is the only way to edit. */
+   Owner mode (PIN) is the only way to edit — except time-off requests,
+   which any employee can submit (they email Alise + note it locally).
+   Pay/rates are intentionally absent from the entire app. */
 
 (function () {
   "use strict";
@@ -27,9 +29,13 @@
     var raw = null;
     try { raw = JSON.parse(localStorage.getItem(LS_STATE)); } catch (e) { raw = null; }
     if (!raw) return seed;
-    // A newer published baseline replaces older local edits (the owner's
-    // edits are what got published, so nothing is lost).
+    // A newer published baseline or a newer app version replaces older
+    // local copies (the owner's edits are what got published, so nothing
+    // of the team's is lost — and old versions may hold retired fields).
+    if ((seed.version || 1) > (raw.version || 1)) return seed;
     if ((seed.publishedAt || 0) > (raw.publishedAt || 0)) return seed;
+    if (!raw.timeoff) raw.timeoff = [];
+    if (!raw.links) raw.links = seed.links;
     return raw;
   }
   function save() {
@@ -57,8 +63,7 @@
   function fmtDate(s) {
     var dt = parseDate(s);
     if (!dt) return "no date";
-    var opts = { month: "short", day: "numeric" };
-    return dt.toLocaleDateString("en-US", opts);
+    return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   }
   function fmtDow(s) {
     var dt = parseDate(s);
@@ -88,7 +93,7 @@
     el.className = "toast";
     el.textContent = msg;
     document.body.appendChild(el);
-    setTimeout(function () { el.remove(); }, 2600);
+    setTimeout(function () { el.remove(); }, 3200);
   }
   function greeting() {
     var h = new Date().getHours();
@@ -197,6 +202,25 @@
   $("modal-backdrop").addEventListener("click", function (e) {
     if (e.target === this) closeModal();
   });
+
+  // ---------- progress ----------
+  function progressFor(list) {
+    var total = list.length;
+    var done = list.filter(function (t) { return t.status === "done"; }).length;
+    return { done: done, total: total, pct: total ? Math.round(done / total * 100) : 0 };
+  }
+  function progressCard(label, list, avatarM, mini) {
+    var p = progressFor(list);
+    var full = p.total > 0 && p.done === p.total;
+    return '<div class="progress-card">' +
+      '<div class="progress-top">' +
+        '<span class="progress-name">' + (avatarM ? avatarHtml(avatarM) + " " : "") + esc(label) + "</span>" +
+        '<span class="progress-pct' + (full ? " full" : "") + '">' + (full ? "100% 🎉" : p.pct + "%") + "</span>" +
+      "</div>" +
+      '<div class="bar' + (mini ? " mini" : "") + '"><div class="bar-fill' + (full ? " full" : "") + '" style="width:' + p.pct + '%"></div></div>' +
+      '<div class="progress-sub">' + p.done + " of " + p.total + " task" + (p.total === 1 ? "" : "s") + " done" + "</div>" +
+      "</div>";
+  }
 
   // ---------- task rendering ----------
   function statusIcon(st) { return st === "done" ? "✓" : st === "inprogress" ? "…" : ""; }
@@ -335,7 +359,7 @@
   function clientForm(clientId) {
     var c = clientId ? client(clientId) : null;
     var isNew = !c;
-    c = c || { id: uid(), name: "", status: "active", contact: "", email: "", phone: "", rate: "", services: "", loomly: "", team: [], notes: "" };
+    c = c || { id: uid(), name: "", status: "active", contact: "", email: "", phone: "", services: "", loomly: "", team: [], notes: "" };
 
     openModal(
       "<h3>" + (isNew ? "New client" : "Edit client") + "</h3>" +
@@ -349,7 +373,6 @@
       "<label>Contact person</label>" + '<input type="text" id="cf-contact" value="' + esc(c.contact) + '">' +
       "<label>Email</label>" + '<input type="text" id="cf-email" value="' + esc(c.email) + '">' +
       "<label>Phone</label>" + '<input type="text" id="cf-phone" value="' + esc(c.phone) + '">' +
-      "<label>Monthly rate</label>" + '<input type="text" id="cf-rate" value="' + esc(c.rate) + '" placeholder="e.g. $850/mo">' +
       "<label>Services</label>" + '<input type="text" id="cf-services" value="' + esc(c.services) + '">' +
       "<label>Loomly / calendar name</label>" + '<input type="text" id="cf-loomly" value="' + esc(c.loomly) + '">' +
       "<label>Team on this client</label>" +
@@ -387,7 +410,6 @@
       c.contact = $("cf-contact").value.trim();
       c.email = $("cf-email").value.trim();
       c.phone = $("cf-phone").value.trim();
-      c.rate = $("cf-rate").value.trim();
       c.services = $("cf-services").value.trim();
       c.loomly = $("cf-loomly").value.trim();
       c.team = teamSel;
@@ -397,6 +419,200 @@
       closeModal();
       toast(isNew ? "Client added ✳" : "Saved ✳");
       renderAll();
+    });
+  }
+
+  // ---------- employee form (owner) ----------
+  var AVATAR_COLORS = ["#c96f85", "#7fa387", "#5b7f68", "#b98d6f", "#8a7fa3", "#c9976f"];
+  function memberForm(memberId) {
+    var m = memberId ? member(memberId) : null;
+    var isNew = !m;
+    m = m || { id: uid(), name: "", full: "", role: "", color: AVATAR_COLORS[state.team.length % AVATAR_COLORS.length], isOwner: false, email: "", info: "" };
+
+    openModal(
+      "<h3>" + (isNew ? "New employee" : "Edit employee") + "</h3>" +
+      "<label>First name (shows on tasks)</label>" + '<input type="text" id="mf-name" value="' + esc(m.name) + '">' +
+      "<label>Full name</label>" + '<input type="text" id="mf-full" value="' + esc(m.full) + '">' +
+      "<label>Role</label>" + '<input type="text" id="mf-role" value="' + esc(m.role) + '" placeholder="e.g. Photoshoots · captions">' +
+      "<label>Email</label>" + '<input type="text" id="mf-email" value="' + esc(m.email || "") + '">' +
+      "<label>Info / notes (visible to the whole team)</label>" +
+      '<textarea id="mf-info">' + esc(m.info || "") + "</textarea>" +
+      '<div class="modal-actions">' +
+        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
+        '<button class="btn btn-gold" id="mf-save">' + (isNew ? "Add employee" : "Save") + "</button>" +
+      "</div>" +
+      (isNew || m.isOwner ? "" : '<div class="danger-zone"><button class="btn-ghost" id="mf-del">Remove this employee</button></div>')
+    );
+
+    $("mf-save").addEventListener("click", function () {
+      var name = $("mf-name").value.trim();
+      if (!name) { $("mf-name").focus(); return; }
+      m.name = name;
+      m.full = $("mf-full").value.trim() || name;
+      m.role = $("mf-role").value.trim();
+      m.email = $("mf-email").value.trim();
+      m.info = $("mf-info").value.trim();
+      if (isNew) state.team.push(m);
+      save();
+      closeModal();
+      toast(isNew ? "Welcome aboard, " + m.name + " ✳" : "Saved ✳");
+      renderAll();
+    });
+    var del = $("mf-del");
+    if (del) del.addEventListener("click", function () {
+      var open = state.tasks.filter(function (t) { return t.assigneeId === m.id && t.status !== "done"; }).length;
+      if (!confirm("Remove " + m.name + "?" + (open ? " They still have " + open + " open task(s) — those will show as unassigned until you reassign them." : ""))) return;
+      state.team = state.team.filter(function (x) { return x.id !== m.id; });
+      state.clients.forEach(function (c) { c.team = c.team.filter(function (id) { return id !== m.id; }); });
+      if (who === m.id) { who = "alise"; localStorage.setItem(LS_WHO, who); }
+      save();
+      closeModal();
+      toast("Removed");
+      renderAll();
+    });
+  }
+
+  // ---------- link form (owner) ----------
+  function linkForm(linkId) {
+    var l = linkId ? state.links.find(function (x) { return x.id === linkId; }) : null;
+    var isNew = !l;
+    l = l || { id: uid(), name: "", emoji: "🔗", desc: "", url: "" };
+
+    openModal(
+      "<h3>" + (isNew ? "Add a link" : "Edit link") + "</h3>" +
+      "<label>Name</label>" + '<input type="text" id="lf-name" value="' + esc(l.name) + '" placeholder="e.g. Dropbox">' +
+      "<label>Emoji</label>" + '<input type="text" id="lf-emoji" value="' + esc(l.emoji) + '" placeholder="📁">' +
+      "<label>What is it for?</label>" + '<input type="text" id="lf-desc" value="' + esc(l.desc) + '">' +
+      "<label>Web address</label>" + '<input type="text" id="lf-url" value="' + esc(l.url) + '" placeholder="https://…">' +
+      '<div class="modal-actions">' +
+        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
+        '<button class="btn btn-gold" id="lf-save">' + (isNew ? "Add link" : "Save") + "</button>" +
+      "</div>" +
+      (isNew ? "" : '<div class="danger-zone"><button class="btn-ghost" id="lf-del">Delete this link</button></div>')
+    );
+
+    $("lf-save").addEventListener("click", function () {
+      var name = $("lf-name").value.trim();
+      var url = $("lf-url").value.trim();
+      if (!name) { $("lf-name").focus(); return; }
+      if (!url) { $("lf-url").focus(); return; }
+      if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+      l.name = name;
+      l.emoji = $("lf-emoji").value.trim() || "🔗";
+      l.desc = $("lf-desc").value.trim();
+      l.url = url;
+      if (isNew) state.links.push(l);
+      save();
+      closeModal();
+      toast(isNew ? "Link added ✳" : "Saved ✳");
+      renderAll();
+    });
+    var del = $("lf-del");
+    if (del) del.addEventListener("click", function () {
+      if (!confirm("Delete the " + l.name + " link?")) return;
+      state.links = state.links.filter(function (x) { return x.id !== l.id; });
+      save();
+      closeModal();
+      toast("Deleted");
+      renderAll();
+    });
+  }
+
+  // ---------- time off ----------
+  function fmtRange(a, b) {
+    return a === b || !b ? fmtDate(a) : fmtDate(a) + " – " + fmtDate(b);
+  }
+  function timeoffForm(entryId) {
+    // Owner: add/edit directly (status approved). Employee: request → email.
+    var owner = isOwner();
+    var e0 = entryId ? state.timeoff.find(function (x) { return x.id === entryId; }) : null;
+    var isNew = !e0;
+    var e = e0 || { id: uid(), memberId: owner ? state.team[0].id : who, start: todayStr(), end: todayStr(), reason: "", status: owner ? "approved" : "requested" };
+
+    openModal(
+      "<h3>" + (owner ? (isNew ? "Add time off" : "Edit time off") : "Request time off") + "</h3>" +
+      (owner
+        ? "<label>Who</label><select id='to-who'>" + state.team.map(function (m) {
+            return '<option value="' + m.id + '"' + (m.id === e.memberId ? " selected" : "") + ">" + esc(m.name) + "</option>";
+          }).join("") + "</select>"
+        : "<p style='font-size:14px;margin:0 0 4px'>This sends an email to Alise and notes your request here on your device.</p>") +
+      "<label>First day off</label>" + '<input type="date" id="to-start" value="' + esc(e.start) + '">' +
+      "<label>Last day off</label>" + '<input type="date" id="to-end" value="' + esc(e.end) + '">' +
+      "<label>Reason (optional)</label>" + '<input type="text" id="to-reason" value="' + esc(e.reason) + '" placeholder="e.g. family trip">' +
+      '<div class="modal-actions">' +
+        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
+        '<button class="btn btn-gold" id="to-save">' + (owner ? "Save" : "Send request") + "</button>" +
+      "</div>" +
+      (owner && !isNew ? '<div class="danger-zone"><button class="btn-ghost" id="to-del">Delete</button></div>' : "")
+    );
+
+    $("to-save").addEventListener("click", function () {
+      var start = $("to-start").value;
+      var end = $("to-end").value || start;
+      if (!start) { $("to-start").focus(); return; }
+      if (end < start) end = start;
+      e.start = start;
+      e.end = end;
+      e.reason = $("to-reason").value.trim();
+      if (owner) {
+        e.memberId = $("to-who").value;
+        e.status = "approved";
+        if (isNew) state.timeoff.push(e);
+        save();
+        closeModal();
+        toast("Time off saved ✳");
+        renderAll();
+      } else {
+        e.memberId = who;
+        e.status = "requested";
+        if (isNew) state.timeoff.push(e);
+        save();
+        closeModal();
+        var m = member(who);
+        var subject = "Time off request — " + (m ? m.full : "team");
+        var body = "Hi Alise!\n\nI'd like to request time off:\n\nFrom: " + fmtDate(start) +
+          "\nThrough: " + fmtDate(end) +
+          (e.reason ? "\nReason: " + e.reason : "") + "\n\nThank you!\n" + (m ? m.name : "");
+        window.location.href = "mailto:" + encodeURIComponent(state.settings.ownerEmail || "alise@claudeandco.design") +
+          "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+        toast("Almost done — hit Send in the email that just opened ✉️");
+        renderAll();
+      }
+    });
+    var del = $("to-del");
+    if (del) del.addEventListener("click", function () {
+      if (!confirm("Delete this time off entry?")) return;
+      state.timeoff = state.timeoff.filter(function (x) { return x.id !== e.id; });
+      save();
+      closeModal();
+      toast("Deleted");
+      renderAll();
+    });
+  }
+
+  function timeoffRow(e) {
+    var m = member(e.memberId);
+    return '<div class="timeoff-row">' +
+      '<span class="to-emoji">🌴</span>' +
+      (m ? avatarHtml(m) : "") +
+      '<span style="flex:1"><b>' + esc(m ? m.name : "?") + "</b> off " + fmtRange(e.start, e.end) +
+      (e.reason ? ' <span style="color:var(--muted)">· ' + esc(e.reason) + "</span>" : "") + "</span>" +
+      '<span class="pill ' + (e.status === "approved" ? "timeoff" : "requested") + '">' + e.status + "</span>" +
+      (isOwner()
+        ? (e.status === "requested" ? '<button class="btn btn-dark btn-sm" data-to-approve="' + e.id + '">Approve</button>' : "") +
+          '<button class="task-edit" data-to-edit="' + e.id + '" title="Edit">✎</button>'
+        : "") +
+      "</div>";
+  }
+  function bindTimeoffButtons(root) {
+    root.querySelectorAll("[data-to-approve]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var e = state.timeoff.find(function (x) { return x.id === b.dataset.toApprove; });
+        if (e) { e.status = "approved"; save(); toast("Approved 🌴"); renderAll(); }
+      });
+    });
+    root.querySelectorAll("[data-to-edit]").forEach(function (b) {
+      b.addEventListener("click", function () { timeoffForm(b.dataset.toEdit); });
     });
   }
 
@@ -448,7 +664,7 @@
     var dateLine = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
 
     var html =
-      "<h2>" + greeting() + ", " + esc(m ? m.name : "friend") + " ☀</h2>" +
+      "<h2>" + greeting() + ", " + esc(m ? m.name : "friend") + " 🌸</h2>" +
       '<p class="view-sub">' + dateLine + "</p>" +
       mineToggle("today") +
       '<div class="stats">' +
@@ -456,7 +672,10 @@
         '<div class="stat gold"><div class="n">' + dueToday.length + '</div><div class="l">Due today</div></div>' +
         '<div class="stat"><div class="n">' + inprog.length + '</div><div class="l">In progress</div></div>' +
         '<div class="stat"><div class="n">' + shootsWeek.length + '</div><div class="l">Shoots this week</div></div>' +
-      "</div>";
+      "</div>" +
+      '<div class="section-label">Progress to 100%</div>' +
+      progressCard((m ? m.name : "You"), state.tasks.filter(function (t) { return t.assigneeId === who; }), m) +
+      progressCard("The whole team", state.tasks, null);
 
     if (overdue.length) {
       html += '<div class="section-label">Needs attention</div>' + overdue.map(function (t) { return taskRow(t); }).join("");
@@ -467,7 +686,7 @@
 
     var todays = sortTasks(pool.filter(function (t) { return t.due === today; }));
     if (!todays.length) {
-      html += '<div class="empty">Nothing due today' + (mineOnly.today ? " for you" : "") + ". Golden. ✳</div>";
+      html += '<div class="empty">Nothing due today' + (mineOnly.today ? " for you" : "") + ". Lovely. 🌿</div>";
     } else {
       var byClient = {};
       todays.forEach(function (t) { (byClient[t.clientId] = byClient[t.clientId] || []).push(t); });
@@ -518,7 +737,7 @@
         '<span class="pill ' + c.status + '">' + c.status + "</span></div>" +
         '<div class="meta-row"><span class="avatars">' + c.team.map(function (id) { return avatarHtml(member(id)); }).join("") + "</span> " +
         "&nbsp;" + open.length + " open task" + (open.length === 1 ? "" : "s") +
-        (od ? ' · <span style="color:var(--rust);font-weight:700">' + od + " overdue</span>" : "") + "</div>" +
+        (od ? ' · <span style="color:var(--rose-deep);font-weight:700">' + od + " overdue</span>" : "") + "</div>" +
         "</div>";
     }
 
@@ -541,12 +760,13 @@
     if (c.contact) html += '<div class="meta-row"><b>Contact:</b> ' + esc(c.contact) + "</div>";
     if (c.email) html += '<div class="meta-row"><b>Email:</b> <a href="mailto:' + esc(c.email) + '">' + esc(c.email) + "</a></div>";
     if (c.phone) html += '<div class="meta-row"><b>Phone:</b> <a href="tel:' + esc(c.phone.replace(/[^0-9+]/g, "")) + '">' + esc(c.phone) + "</a></div>";
-    if (isOwner() && c.rate) html += '<div class="meta-row"><b>Rate:</b> ' + esc(c.rate) + " <span style='color:var(--muted);font-size:11px'>(owner-only)</span></div>";
     if (c.services) html += '<div class="meta-row"><b>Services:</b> ' + esc(c.services) + "</div>";
     if (c.loomly) html += '<div class="meta-row"><b>Calendar:</b> ' + esc(c.loomly) + "</div>";
     if (c.team.length) html += '<div class="meta-row" style="margin-top:6px"><span class="avatars">' + c.team.map(function (id) { return avatarHtml(member(id)); }).join("") + "</span> &nbsp;" +
-      c.team.map(function (id) { var mm = member(id); return mm ? mm.name : ""; }).join(" · ") + "</div>";
+      c.team.map(function (id) { var mm = member(id); return mm ? mm.name : ""; }).filter(Boolean).join(" · ") + "</div>";
     if (c.notes) html += '<div class="task-notes" style="margin-top:8px">' + esc(c.notes) + "</div>";
+
+    if (list.length) html += progressCard("Progress for " + c.name, list, null, true);
 
     html += '<div class="section-label" style="margin-top:16px">Open' +
       (isOwner() ? ' <button class="btn btn-dark btn-sm" id="cd-add">+ Task</button>' : "") + "</div>";
@@ -564,7 +784,6 @@
     if (add) add.addEventListener("click", function () { taskForm(null, cid); });
     var ed = $("cd-edit");
     if (ed) ed.addEventListener("click", function () { clientForm(cid); });
-    // Re-open detail after inline status changes so the modal stays fresh:
     $("modal").querySelectorAll("[data-cycle]").forEach(function (b) {
       b.addEventListener("click", function () { setTimeout(function () { clientDetail(cid); }, 0); });
     });
@@ -572,23 +791,60 @@
 
   function renderTeam() {
     var v = $("view-team");
+    var today = todayStr();
+    var upcomingOff = state.timeoff
+      .filter(function (e) { return e.end >= today; })
+      .sort(function (a, b) { return a.start.localeCompare(b.start); });
+
     var html = "<h2>The team</h2>" +
-      '<p class="view-sub">Who\'s carrying what right now</p>';
+      '<p class="view-sub">Who\'s carrying what, and how far along everyone is</p>';
+
+    html += progressCard("Team progress", state.tasks, null);
+
+    html += '<div class="section-label">Time off' +
+      (isOwner()
+        ? ' <button class="btn btn-dark btn-sm" id="to-add">+ Add time off</button>'
+        : ' <button class="btn btn-dark btn-sm" id="to-request">🌴 Request time off</button>') +
+      "</div>";
+    html += upcomingOff.length
+      ? upcomingOff.map(timeoffRow).join("")
+      : '<div class="empty">No time off coming up.</div>';
+
+    html += '<div class="section-label">Everyone' +
+      (isOwner() ? ' <button class="btn btn-dark btn-sm" id="mf-add">+ Employee</button>' : "") + "</div>";
+
     state.team.forEach(function (m) {
-      var mine = sortTasks(openTasks().filter(function (t) { return t.assigneeId === m.id; }));
+      var mineAll = state.tasks.filter(function (t) { return t.assigneeId === m.id; });
+      var mine = sortTasks(mineAll.filter(function (t) { return t.status !== "done"; }));
       var shoots = mine.filter(function (t) { return t.kind === "shoot"; });
       html += '<div class="card">' +
         '<div class="card-head"><div style="display:flex;align-items:center;gap:10px">' + avatarHtml(m, true) +
         "<div><h3 class='card-title'>" + esc(m.full) + "</h3><div class='card-sub'>" + esc(m.role) + "</div></div></div>" +
-        '<span class="pill todo">' + mine.length + " open</span></div>" +
+        '<span style="display:flex;gap:6px;align-items:center">' +
+          '<span class="pill todo">' + mine.length + " open</span>" +
+          (isOwner() ? '<button class="task-edit" data-mf-edit="' + m.id + '" title="Edit">✎</button>' : "") +
+        "</span></div>" +
+        (m.email ? '<div class="meta-row"><b>Email:</b> <a href="mailto:' + esc(m.email) + '">' + esc(m.email) + "</a></div>" : "") +
+        (m.info ? '<div class="task-notes" style="margin-bottom:8px">' + esc(m.info) + "</div>" : "") +
+        progressCard(m.name + "'s progress", mineAll, null, true) +
         (mine.length
           ? mine.map(function (t) { return taskRow(t, { hideWho: true, inCard: true }); }).join("")
-          : '<div class="empty">All clear ✳</div>') +
+          : '<div class="empty">All clear 🌿</div>') +
         (shoots.length ? '<div class="card-sub" style="margin-top:4px">📷 ' + shoots.length + " shoot" + (shoots.length === 1 ? "" : "s") + " coming up</div>" : "") +
         "</div>";
     });
     v.innerHTML = html;
     bindTaskButtons(v);
+    bindTimeoffButtons(v);
+    var toAdd = $("to-add");
+    if (toAdd) toAdd.addEventListener("click", function () { timeoffForm(null); });
+    var toReq = $("to-request");
+    if (toReq) toReq.addEventListener("click", function () { timeoffForm(null); });
+    var mfAdd = $("mf-add");
+    if (mfAdd) mfAdd.addEventListener("click", function () { memberForm(null); });
+    v.querySelectorAll("[data-mf-edit]").forEach(function (b) {
+      b.addEventListener("click", function () { memberForm(b.dataset.mfEdit); });
+    });
   }
 
   function renderSchedule() {
@@ -597,11 +853,17 @@
     var pool = mineOnly.schedule ? mineFilter(state.tasks) : state.tasks;
     var upcoming = sortTasks(pool.filter(function (t) { return t.status !== "done" && t.due && t.due >= today; }));
     var byDay = {};
-    upcoming.forEach(function (t) { (byDay[t.due] = byDay[t.due] || []).push(t); });
+    upcoming.forEach(function (t) { (byDay[t.due] = byDay[t.due] || { tasks: [], off: [] }).tasks.push(t); });
+    state.timeoff.forEach(function (e) {
+      if (e.status !== "approved" || e.end < today) return;
+      if (mineOnly.schedule && e.memberId !== who) return;
+      var key = e.start >= today ? e.start : today;
+      (byDay[key] = byDay[key] || { tasks: [], off: [] }).off.push(e);
+    });
     var days = Object.keys(byDay).sort();
 
     var html = "<h2>Schedule</h2>" +
-      '<p class="view-sub">Shoots and deadlines, day by day</p>' +
+      '<p class="view-sub">Shoots, deadlines, and time off — day by day</p>' +
       mineToggle("schedule") +
       (isOwner() ? '<div class="filter-row"><button class="btn btn-dark btn-sm" data-newshoot>+ Schedule a shoot</button></div>' : "");
 
@@ -613,15 +875,16 @@
       html += '<div class="day-group"><div class="day-head' + (isToday ? " today-head" : "") + '">' +
         '<span class="dow">' + fmtDow(day) + "</span> " + fmtDate(day) +
         (isToday ? ' <span class="today-flag">today</span>' : "") + "</div>" +
-        byDay[day].map(function (t) { return taskRow(t); }).join("") + "</div>";
+        byDay[day].off.map(timeoffRow).join("") +
+        byDay[day].tasks.map(function (t) { return taskRow(t); }).join("") + "</div>";
     });
     v.innerHTML = html;
     bindTaskButtons(v);
+    bindTimeoffButtons(v);
     bindMineToggle(v, "schedule");
     var nb = v.querySelector("[data-newshoot]");
     if (nb) nb.addEventListener("click", function () {
       taskForm(null);
-      // preset to shoot
       var shootBtn = document.querySelector('#tf-kind [data-k="shoot"]');
       if (shootBtn) shootBtn.click();
     });
@@ -631,11 +894,23 @@
     var v = $("view-links");
     v.innerHTML = "<h2>Studio links</h2>" +
       '<p class="view-sub">Every tool we use, one tap away</p>' +
+      (isOwner() ? '<div class="filter-row"><button class="btn btn-dark btn-sm" id="lf-add">+ Add link</button></div>' : "") +
       '<div class="links-grid">' + state.links.map(function (l) {
         return '<a class="link-card" href="' + esc(l.url) + '" target="_blank" rel="noopener">' +
-          '<div class="emoji">' + l.emoji + '</div><div class="name">' + esc(l.name) + '</div>' +
-          '<div class="desc">' + esc(l.desc) + "</div></a>";
+          '<div class="emoji">' + esc(l.emoji) + '</div><div class="name">' + esc(l.name) + '</div>' +
+          '<div class="desc">' + esc(l.desc) + "</div>" +
+          (isOwner() ? '<button class="link-edit" data-lf-edit="' + l.id + '" title="Edit">✎</button>' : "") +
+          "</a>";
       }).join("") + "</div>";
+    var add = $("lf-add");
+    if (add) add.addEventListener("click", function () { linkForm(null); });
+    v.querySelectorAll("[data-lf-edit]").forEach(function (b) {
+      b.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        linkForm(b.dataset.lfEdit);
+      });
+    });
   }
 
   // ---------- publish / settings (owner) ----------
@@ -656,7 +931,7 @@
       "(function () { window.CCO_SEED = " + JSON.stringify(out, null, 2) + "; })();\n";
     download("cco-hq-data.js", file);
     openModal(
-      "<h3>Almost published ✳</h3>" +
+      "<h3>Almost published 🌸</h3>" +
       "<p style='font-size:14px'>A file called <b>cco-hq-data.js</b> just downloaded. It has everything you changed.</p>" +
       "<p style='font-size:14px'>Now just tell Claude:</p>" +
       "<p style='background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:12px;font-weight:700'>“Publish my Studio HQ updates”</p>" +
@@ -672,6 +947,8 @@
       '<input type="text" id="st-access" value="' + esc(state.settings.accessCode) + '">' +
       "<label>Owner PIN (just you)</label>" +
       '<input type="text" id="st-pin" value="' + esc(state.settings.ownerPin) + '">' +
+      "<label>Owner email (time-off requests go here)</label>" +
+      '<input type="text" id="st-email" value="' + esc(state.settings.ownerEmail || "") + '">' +
       '<p class="hint">If you change these, hit Publish so the live site gets the new ones — and tell the team the new password.</p>' +
       '<div class="modal-actions">' +
         '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
@@ -685,11 +962,13 @@
     $("st-save").addEventListener("click", function () {
       var ac = $("st-access").value.trim();
       var pin = $("st-pin").value.trim();
+      var em = $("st-email").value.trim();
       if (ac) state.settings.accessCode = ac;
       if (pin) state.settings.ownerPin = pin;
+      if (em) state.settings.ownerEmail = em;
       save();
       closeModal();
-      toast("Settings saved ✳");
+      toast("Settings saved 🌸");
     });
     $("st-export").addEventListener("click", function () {
       download("cco-hq-backup.json", JSON.stringify(state, null, 2));

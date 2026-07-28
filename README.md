@@ -11,9 +11,16 @@ dependencies) so it deploys straight to Vercel.
   Today board, clients, their own tasks, and scheduled shoots — read-only.
 - **Only Alise** can edit. She taps **Owner login** and enters her PIN
   (`settings.ownerPin`). Owner mode unlocks: status changes (to do → in
-  progress → done), adding/editing tasks, shoots, and clients, plus Settings.
-- Client **rates show only in owner mode** and employee pay is deliberately not
-  in this app at all.
+  progress → done), adding/editing tasks, shoots, clients, employees, and
+  links, plus Settings. One exception: any employee can submit a **time-off
+  request** — it opens an email to Alise and notes the request on their device;
+  Alise approves it in Owner mode (approved time off shows on the Schedule).
+- **Pay and client rates are deliberately absent from the entire app** — not
+  stored, not displayed, not even in owner mode (v2 removed the field
+  completely; the v2 version bump wipes any v1 local copies that had it).
+- Progress bars (per person, per client, whole team) count done vs. total
+  tasks — delete old done tasks now and then to keep the bars meaningful.
+- v2 look: blush pink + pine green (replaces the v1 charcoal/gold).
 
 ## Where the data lives (important)
 

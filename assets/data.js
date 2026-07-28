@@ -1,8 +1,10 @@
-/* Claude & Co. Studio HQ — seed data.
+/* Claude & Co. Studio HQ — seed data (v2).
    This is the baseline everyone sees on first visit. Alise's in-app edits
    save on her device and go live for the team via "Publish to team"
    (see README.md). Dates below are relative to today so the board always
-   looks current until real dates are set in the app. */
+   looks current until real dates are set in the app.
+   NOTE: pay and client rates are deliberately NOT stored anywhere in this
+   app — huge no-go per Alise. */
 
 (function () {
   function d(offsetDays) {
@@ -14,64 +16,69 @@
   }
 
   window.CCO_SEED = {
-    version: 1,
+    version: 2,
     settings: {
       accessCode: "goldenhour",
-      ownerPin: "2026"
+      ownerPin: "2026",
+      ownerEmail: "alise@claudeandco.design"
     },
     team: [
-      { id: "alise",   name: "Alise",   full: "Alise McCreary",         role: "Owner · creative director", color: "#d99a1e", isOwner: true },
-      { id: "hannah",  name: "Hannah",  full: "Hannah Edmunds",         role: "Photoshoots · captions · Loomly drafts", color: "#c75b24", isOwner: false },
-      { id: "brailey", name: "Brailey", full: "Brailey Connor",         role: "Loomly scheduling · photoshoots", color: "#7d8450", isOwner: false },
-      { id: "maddie",  name: "Maddie",  full: "Madison Taylor Newsom",  role: "Client outreach · JM Services Loomly", color: "#8a6f4e", isOwner: false }
+      { id: "alise",   name: "Alise",   full: "Alise McCreary",        role: "Owner · creative director", color: "#c96f85", isOwner: true,
+        email: "alise@claudeandco.design", info: "The boss. Final word on all client work." },
+      { id: "hannah",  name: "Hannah",  full: "Hannah Edmunds",        role: "Photoshoots · captions · Loomly drafts", color: "#7fa387", isOwner: false,
+        email: "hedmunds24@gmail.com", info: "Leads Kristie Bridgers content. Weekly check-in Wednesdays." },
+      { id: "brailey", name: "Brailey", full: "Brailey Connor",        role: "Loomly scheduling · photoshoots", color: "#5b7f68", isOwner: false,
+        email: "braileyconnor04@gmail.com", info: "Owns Loomly calendars (except JM Services). Leads Right-Way Realty." },
+      { id: "maddie",  name: "Maddie",  full: "Madison Taylor Newsom", role: "Client outreach · JM Services Loomly", color: "#b98d6f", isOwner: false,
+        email: "madisontaylornewsom@gmail.com", info: "All outreach — 10 emails/week per market, notes in the prospect sheet." }
     ],
     clients: [
       {
         id: "kristie", name: "Kristie Bridgers", status: "active",
         contact: "Kristie Bridgers", email: "kbridgers@mac.com", phone: "(662) 801-4712",
-        rate: "$927/mo", services: "Social media content · lead outreach · brand collabs",
+        services: "Social media content · lead outreach · brand collabs",
         loomly: "Kristie Bridgers", team: ["hannah", "brailey"],
         notes: "Hannah leads captions + content. Collabs inbox: kbridgerscollabs@gmail.com (DM outreach only). Tends to pay late — remind 2–3 days before due."
       },
       {
         id: "rightway", name: "Right-Way Realty", status: "active",
         contact: "April White", email: "april@right-wayrealty.com", phone: "(662) 801-6806",
-        rate: "$850/mo", services: "Social media content · real estate marketing",
+        services: "Social media content · real estate marketing",
         loomly: "April Wright", team: ["brailey"],
         notes: "Brailey leads. April is very collaborative — “I'm going to let you make the call.”"
       },
       {
         id: "jm", name: "JM Services", status: "active",
         contact: "Mike Jones", email: "mjones@jmservices.biz", phone: "(662) 554-1056",
-        rate: "$500–540/mo", services: "Monthly social media · CU project collab",
+        services: "Monthly social media · CU project collab",
         loomly: "JM Services", team: ["maddie"],
         notes: "VIP — longest-running client, never missed a payment. Maddie owns the Loomly calendar. CU project with Cara (cara@odie-bs.com)."
       },
       {
         id: "ggfry", name: "G&G Fry Co.", status: "active",
         contact: "Brashonda", email: "gg.fryco@gmail.com", phone: "(662) 801-4604",
-        rate: "$463.50/mo", services: "Social media content · occasional design",
+        services: "Social media content · occasional design",
         loomly: "G&G Fry Co.", team: ["brailey"],
         notes: "Pays late consistently — send reminders 2–3 days before due."
       },
       {
         id: "ellas-lambeth", name: "Ella's Table + Lambeth Lounge", status: "active",
         contact: "Danielle", email: "", phone: "",
-        rate: "$400/mo", services: "Social media for both venues",
+        services: "Social media for both venues",
         loomly: "Hey Orca — Ella's & Lambeth", team: ["alise", "hannah"],
         notes: "Kickoff July 13. Paid by mailed corporate check every Wednesday. Ella's = refined classic Southern dining; Lambeth = hotel lounge, 40+ alumni crowd — lean into “romanticize campus.”"
       },
       {
         id: "anchorbay", name: "Anchor Bay Therapy", status: "active",
         contact: "Brandice Valentino", email: "", phone: "",
-        rate: "Project-based", services: "Social media · brand strategy · domains",
+        services: "Social media · brand strategy · domains",
         loomly: "", team: ["alise"],
         notes: "Two brands: Anchor Bay Therapy + Creativity People. Calm, clean, minimalist + San Miguel + bright/happy. GoDaddy customer ID 17196504."
       },
       {
         id: "windowjoe", name: "Window Joe Oxford", status: "pending",
         contact: "Joe Climer", email: "windowjoeoxford@gmail.com", phone: "(662) 281-6936",
-        rate: "$500/mo (proposed)", services: "Social media · Squarespace landing page",
+        services: "Social media · Squarespace landing page",
         loomly: "", team: ["hannah", "alise"],
         notes: "Contract pending. Wants a Squarespace landing page tied to Google Ads. Tech dinosaur — extra hand-holding."
       }
@@ -97,19 +104,23 @@
       // ---- done example ----
       { id: "t11", clientId: "rightway", title: "July invoice sent", assigneeId: "alise", due: d(-1), time: "", status: "done", kind: "task", location: "", notes: "" }
     ],
+    timeoff: [
+      // Sample entry — Alise: edit or delete in Owner mode.
+      { id: "to1", memberId: "hannah", start: d(18), end: d(20), reason: "Family trip", status: "approved" }
+    ],
     links: [
-      { name: "Loomly", emoji: "📅", desc: "Social scheduling — Brailey owns calendars, Maddie owns JM", url: "https://www.loomly.com/" },
-      { name: "Hey Orca", emoji: "🐳", desc: "Ella's Table + Lambeth Lounge calendar", url: "https://www.heyorca.com/" },
-      { name: "Square Invoices", emoji: "💸", desc: "Invoicing + payments", url: "https://squareup.com/dashboard/invoices" },
-      { name: "Canva", emoji: "🎨", desc: "Design — client folders live here", url: "https://www.canva.com/" },
-      { name: "Gmail", emoji: "✉️", desc: "alise@claudeandco.design", url: "https://mail.google.com/" },
-      { name: "Google Calendar", emoji: "🗓", desc: "Shoots + client calls", url: "https://calendar.google.com/" },
-      { name: "Google Analytics", emoji: "📈", desc: "Client site + web traffic", url: "https://analytics.google.com/" },
-      { name: "Framer", emoji: "🖥", desc: "claudeandco.design website", url: "https://framer.com/" },
-      { name: "GoDaddy", emoji: "🌐", desc: "Domains — claudeandco.design + client domains", url: "https://www.godaddy.com/" },
-      { name: "Notta", emoji: "🎧", desc: "Meeting notes + transcripts", url: "https://www.notta.ai/" },
-      { name: "Manychat", emoji: "💬", desc: "DM automation", url: "https://manychat.com/" },
-      { name: "Venmo", emoji: "💵", desc: "Team payouts", url: "https://venmo.com/" }
+      { id: "l1", name: "Loomly", emoji: "📅", desc: "Social scheduling — Brailey owns calendars, Maddie owns JM", url: "https://www.loomly.com/" },
+      { id: "l2", name: "Hey Orca", emoji: "🐳", desc: "Ella's Table + Lambeth Lounge calendar", url: "https://www.heyorca.com/" },
+      { id: "l3", name: "Square Invoices", emoji: "💸", desc: "Invoicing + payments", url: "https://squareup.com/dashboard/invoices" },
+      { id: "l4", name: "Canva", emoji: "🎨", desc: "Design — client folders live here", url: "https://www.canva.com/" },
+      { id: "l5", name: "Gmail", emoji: "✉️", desc: "alise@claudeandco.design", url: "https://mail.google.com/" },
+      { id: "l6", name: "Google Calendar", emoji: "🗓", desc: "Shoots + client calls", url: "https://calendar.google.com/" },
+      { id: "l7", name: "Google Analytics", emoji: "📈", desc: "Client site + web traffic", url: "https://analytics.google.com/" },
+      { id: "l8", name: "Framer", emoji: "🖥", desc: "claudeandco.design website", url: "https://framer.com/" },
+      { id: "l9", name: "GoDaddy", emoji: "🌐", desc: "Domains — claudeandco.design + client domains", url: "https://www.godaddy.com/" },
+      { id: "l10", name: "Notta", emoji: "🎧", desc: "Meeting notes + transcripts", url: "https://www.notta.ai/" },
+      { id: "l11", name: "Manychat", emoji: "💬", desc: "DM automation", url: "https://manychat.com/" },
+      { id: "l12", name: "Venmo", emoji: "💵", desc: "Team payouts", url: "https://venmo.com/" }
     ]
   };
 })();
