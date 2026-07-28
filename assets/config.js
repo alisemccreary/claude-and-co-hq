@@ -6,5 +6,8 @@
 
 window.CCO_CONFIG = {
   SUPABASE_URL: "https://agwjsxfczbcuewnxehrr.supabase.co",
-  SUPABASE_ANON_KEY: "sb_publishable_XTVmHr1mg6ScxTR3rkQuTQ_XrhInQMa"
+  SUPABASE_ANON_KEY: "sb_publishable_XTVmHr1mg6ScxTR3rkQuTQ_XrhInQMa",
+  /* The email of the Supabase auth user Alise signs in with (this is
+     separate from settings.ownerEmail, where time-off notifications go). */
+  OWNER_LOGIN_EMAIL: "alisemccreary@gmail.com"
 };

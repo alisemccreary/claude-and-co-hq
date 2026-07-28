@@ -316,7 +316,7 @@
       if (!v) return;
       if (cloud) {
         $("pin-go").textContent = "…";
-        sb.auth.signInWithPassword({ email: state.settings.ownerEmail || "alise@claudeandco.design", password: v })
+        sb.auth.signInWithPassword({ email: cfg.OWNER_LOGIN_EMAIL || state.settings.ownerEmail || "alise@claudeandco.design", password: v })
           .then(function (res) {
             if (res.error) {
               $("pin-go").textContent = "Unlock";
