@@ -1,8 +1,12 @@
-/* Claude & Co. Studio HQ — app logic (v2).
-   Plain JS, no dependencies. State lives in localStorage on each device;
-   the shipped assets/data.js is the shared baseline for the whole team.
-   Owner mode (PIN) is the only way to edit — except time-off requests,
-   which any employee can submit (they email Alise + note it locally).
+/* Claude & Co. Studio HQ — app logic (v3, cloud-synced).
+   Data lives in Supabase when assets/config.js has real values:
+   - app_state table: one JSON row, readable by all, writable only by
+     Alise's signed-in owner account (enforced server-side by RLS).
+   - timeoff table: readable by all; anyone can INSERT a 'requested' row
+     (that's how employees submit); only the owner can approve/deny/delete.
+   Everyone's screen refreshes on tab focus and every 30 seconds.
+   Without config values the app falls back to the old local-only mode
+   (localStorage + Publish-to-team), so nothing breaks mid-upgrade.
    Pay/rates are intentionally absent from the entire app. */
 
 (function () {
@@ -13,15 +17,27 @@
   var LS_WHO = "cco-hq-who-v1";
   var SS_OWNER = "cco-hq-owner-v1";
 
+  // ---------- cloud setup ----------
+  var cfg = window.CCO_CONFIG || {};
+  var cloud = !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY &&
+    cfg.SUPABASE_URL.indexOf("PASTE_") < 0 && cfg.SUPABASE_ANON_KEY.indexOf("PASTE_") < 0 &&
+    window.supabase);
+  var sb = cloud ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY) : null;
+  var ownerFlag = false;          // cloud mode: true when signed in as Alise
+  var lastLocalEdit = 0;          // guards polling from clobbering in-flight edits
+  var pendingCloudState = null;   // cloud refresh arriving while a modal is open
+
   var state = loadState();
   var who = localStorage.getItem(LS_WHO) || "alise";
   var activeTab = "today";
   var mineOnly = { today: false, schedule: false };
 
-  // ---------- state ----------
+  // ---------- state (local cache layer) ----------
   function seedCopy() {
     var s = JSON.parse(JSON.stringify(window.CCO_SEED));
     if (!s.publishedAt) s.publishedAt = 0;
+    if (!s.timeoff) s.timeoff = [];
+    if (!s.links) s.links = [];
     return s;
   }
   function loadState() {
@@ -29,19 +45,141 @@
     var raw = null;
     try { raw = JSON.parse(localStorage.getItem(LS_STATE)); } catch (e) { raw = null; }
     if (!raw) return seed;
-    // A newer published baseline or a newer app version replaces older
-    // local copies (the owner's edits are what got published, so nothing
-    // of the team's is lost — and old versions may hold retired fields).
     if ((seed.version || 1) > (raw.version || 1)) return seed;
-    if ((seed.publishedAt || 0) > (raw.publishedAt || 0)) return seed;
+    if (!cloud && (seed.publishedAt || 0) > (raw.publishedAt || 0)) return seed;
     if (!raw.timeoff) raw.timeoff = [];
     if (!raw.links) raw.links = seed.links;
     return raw;
   }
-  function save() {
+  function cacheLocal() {
     try { localStorage.setItem(LS_STATE, JSON.stringify(state)); } catch (e) {}
   }
-  function isOwner() { return sessionStorage.getItem(SS_OWNER) === "1"; }
+  function save() {
+    lastLocalEdit = Date.now();
+    cacheLocal();
+    if (cloud && ownerFlag) pushStateSoon();
+  }
+
+  // ---------- cloud sync ----------
+  var pushTimer = null;
+  function stateForCloud() {
+    var out = JSON.parse(JSON.stringify(state));
+    delete out.timeoff; // lives in its own table
+    return out;
+  }
+  function pushStateSoon() {
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(pushStateNow, 700);
+  }
+  function pushStateNow() {
+    clearTimeout(pushTimer);
+    pushTimer = null;
+    return sb.from("app_state").upsert({ id: 1, data: stateForCloud(), updated_at: new Date().toISOString() })
+      .then(function (res) {
+        if (res.error) toast("⚠️ Couldn't save to the cloud — check your internet");
+      });
+  }
+  function rowToEntry(r) {
+    return { id: r.id, memberId: r.member_id, start: r.start_day, end: r.end_day, reason: r.reason || "", status: r.status };
+  }
+  function refreshCloud() {
+    if (!cloud) return Promise.resolve();
+    if (pushTimer || (ownerFlag && Date.now() - lastLocalEdit < 5000)) return Promise.resolve();
+    return Promise.all([
+      sb.from("app_state").select("data").eq("id", 1).maybeSingle(),
+      sb.from("timeoff").select("*").order("start_day")
+    ]).then(function (results) {
+      var stateRes = results[0], toRes = results[1];
+      if (stateRes.error || toRes.error) return;
+      var next = stateRes.data ? stateRes.data.data : stateForCloud();
+      next.timeoff = (toRes.data || []).map(rowToEntry);
+      if (JSON.stringify(next) === JSON.stringify(state)) return;
+      if (!$("modal-backdrop").classList.contains("hidden")) {
+        pendingCloudState = next; // don't yank a form out from under anyone
+        return;
+      }
+      state = next;
+      cacheLocal();
+      renderAll();
+    });
+  }
+  function seedCloudIfEmpty() {
+    // First owner sign-in: if the cloud is empty, upload this device's
+    // data as the starting point (including migrating old local time off).
+    return sb.from("app_state").select("id").eq("id", 1).maybeSingle().then(function (res) {
+      if (res.error || res.data) return;
+      var oldOff = (state.timeoff || []).map(function (e) {
+        return { member_id: e.memberId, start_day: e.start, end_day: e.end || e.start, reason: e.reason || "", status: e.status || "approved" };
+      });
+      return pushStateNow().then(function () {
+        if (oldOff.length) return sb.from("timeoff").insert(oldOff);
+      }).then(function () {
+        toast("Cloud is set up — everything now syncs live ✨");
+        refreshCloud();
+      });
+    });
+  }
+
+  // ---------- time off data access (works in both modes) ----------
+  function toSubmitRequest(e) {
+    if (cloud) {
+      return sb.from("timeoff").insert({ member_id: e.memberId, start_day: e.start, end_day: e.end, reason: e.reason, status: "requested" })
+        .then(function (res) {
+          if (res.error) { toast("⚠️ Couldn't send — check your internet"); return; }
+          refreshCloudForce();
+        });
+    }
+    state.timeoff.push(e); save(); renderAll();
+    return Promise.resolve();
+  }
+  function toOwnerUpsert(e, isNew) {
+    if (cloud) {
+      var row = { member_id: e.memberId, start_day: e.start, end_day: e.end, reason: e.reason, status: e.status };
+      var q = isNew ? sb.from("timeoff").insert(row) : sb.from("timeoff").update(row).eq("id", e.id);
+      return q.then(function (res) {
+        if (res.error) { toast("⚠️ Couldn't save — are you logged in as owner?"); return; }
+        refreshCloudForce();
+      });
+    }
+    if (isNew) state.timeoff.push(e);
+    save(); renderAll();
+    return Promise.resolve();
+  }
+  function toSetStatus(id, status, msg) {
+    if (cloud) {
+      return sb.from("timeoff").update({ status: status }).eq("id", id).then(function (res) {
+        if (res.error) { toast("⚠️ Couldn't update — are you logged in as owner?"); return; }
+        toast(msg);
+        refreshCloudForce();
+      });
+    }
+    var e = state.timeoff.find(function (x) { return x.id === id; });
+    if (e) { e.status = status; save(); toast(msg); renderAll(); }
+    return Promise.resolve();
+  }
+  function toDelete(id) {
+    if (cloud) {
+      return sb.from("timeoff").delete().eq("id", id).then(function (res) {
+        if (res.error) { toast("⚠️ Couldn't delete — are you logged in as owner?"); return; }
+        toast("Deleted");
+        refreshCloudForce();
+      });
+    }
+    state.timeoff = state.timeoff.filter(function (x) { return x.id !== id; });
+    save(); toast("Deleted"); renderAll();
+    return Promise.resolve();
+  }
+  function refreshCloudForce() {
+    lastLocalEdit = 0;
+    var t = pushTimer;
+    if (t) { pushStateNow().then(function () { refreshCloud(); }); return; }
+    refreshCloud();
+  }
+
+  // ---------- owner status ----------
+  function isOwner() {
+    return cloud ? ownerFlag : sessionStorage.getItem(SS_OWNER) === "1";
+  }
 
   // ---------- helpers ----------
   function $(id) { return document.getElementById(id); }
@@ -156,24 +294,48 @@
 
   // ---------- owner mode ----------
   function ownerLogin(onSuccess) {
+    var label = cloud ? "Owner password" : "PIN";
     openModal(
       "<h3>Owner login</h3>" +
-      '<label>PIN</label><input type="password" id="pin-in" inputmode="numeric" autocomplete="off">' +
+      "<label>" + label + "</label>" +
+      '<input type="password" id="pin-in" autocomplete="current-password">' +
+      (cloud ? '<p class="hint">This is your Supabase owner password — it stays signed in on this device.</p>' : "") +
       '<div class="modal-actions"><button class="btn btn-outline-dark" data-close>Cancel</button>' +
       '<button class="btn btn-gold" id="pin-go">Unlock</button></div>'
     );
     var input = $("pin-in");
     input.focus();
+    function done() {
+      closeModal();
+      toast("Owner mode on — edit away ✳");
+      renderAll();
+      if (onSuccess) onSuccess();
+    }
     function go() {
-      if (input.value.trim() === String(state.settings.ownerPin)) {
-        sessionStorage.setItem(SS_OWNER, "1");
-        closeModal();
-        toast("Owner mode on — edit away ✳");
-        renderAll();
-        if (onSuccess) onSuccess();
+      var v = input.value.trim();
+      if (!v) return;
+      if (cloud) {
+        $("pin-go").textContent = "…";
+        sb.auth.signInWithPassword({ email: state.settings.ownerEmail || "alise@claudeandco.design", password: v })
+          .then(function (res) {
+            if (res.error) {
+              $("pin-go").textContent = "Unlock";
+              input.value = "";
+              input.placeholder = "Nope — try again";
+              return;
+            }
+            ownerFlag = true;
+            seedCloudIfEmpty();
+            done();
+          });
       } else {
-        input.value = "";
-        input.placeholder = "Nope — try again";
+        if (v === String(state.settings.ownerPin)) {
+          sessionStorage.setItem(SS_OWNER, "1");
+          done();
+        } else {
+          input.value = "";
+          input.placeholder = "Nope — try again";
+        }
       }
     }
     $("pin-go").addEventListener("click", go);
@@ -184,7 +346,8 @@
     ownerLogin();
   });
   $("lock-btn").addEventListener("click", function () {
-    sessionStorage.removeItem(SS_OWNER);
+    if (cloud) { ownerFlag = false; sb.auth.signOut(); }
+    else sessionStorage.removeItem(SS_OWNER);
     toast("Locked. View-only now.");
     renderAll();
   });
@@ -192,6 +355,10 @@
   function renderOwnerUI() {
     $("owner-bar").classList.toggle("hidden", !isOwner());
     $("owner-btn").classList.toggle("hidden", isOwner());
+    $("publish-btn").classList.toggle("hidden", cloud || !isOwner());
+    $("owner-bar-text").textContent = cloud
+      ? "✳ Owner mode — edits save live for the whole team."
+      : "✳ Owner mode — you can edit everything.";
   }
 
   // ---------- modal plumbing ----------
@@ -205,6 +372,12 @@
   function closeModal() {
     $("modal-backdrop").classList.add("hidden");
     $("modal").innerHTML = "";
+    if (pendingCloudState) {
+      state = pendingCloudState;
+      pendingCloudState = null;
+      cacheLocal();
+      renderAll();
+    }
   }
   $("modal-backdrop").addEventListener("click", function (e) {
     if (e.target === this) closeModal();
@@ -531,12 +704,12 @@
   }
   function b64e(s) { return btoa(unescape(encodeURIComponent(s))); }
   function b64d(s) { return decodeURIComponent(escape(atob(s))); }
+
   function timeoffForm(entryId) {
-    // Owner: add/edit directly (status approved). Employee: request → email.
     var owner = isOwner();
     var e0 = entryId ? state.timeoff.find(function (x) { return x.id === entryId; }) : null;
     var isNew = !e0;
-    var e = e0 || { id: uid(), memberId: owner ? state.team[0].id : who, start: todayStr(), end: todayStr(), reason: "", status: owner ? "approved" : "requested" };
+    var e = e0 ? JSON.parse(JSON.stringify(e0)) : { id: uid(), memberId: owner ? state.team[0].id : who, start: todayStr(), end: todayStr(), reason: "", status: owner ? "approved" : "requested" };
 
     openModal(
       "<h3>" + (owner ? (isNew ? "Add time off" : "Edit time off") : "Request time off") + "</h3>" +
@@ -544,7 +717,9 @@
         ? "<label>Who</label><select id='to-who'>" + state.team.map(function (m) {
             return '<option value="' + m.id + '"' + (m.id === e.memberId ? " selected" : "") + ">" + esc(m.name) + "</option>";
           }).join("") + "</select>"
-        : "<p style='font-size:14px;margin:0 0 4px'>This sends an email to Alise and notes your request here on your device.</p>") +
+        : (cloud
+            ? "<p style='font-size:14px;margin:0 0 4px'>Your request goes straight to Alise's Team tab — she'll approve or deny it there.</p>"
+            : "<p style='font-size:14px;margin:0 0 4px'>This sends an email to Alise and notes your request here on your device.</p>")) +
       "<label>First day off</label>" + '<input type="date" id="to-start" value="' + esc(e.start) + '">' +
       "<label>Last day off</label>" + '<input type="date" id="to-end" value="' + esc(e.end) + '">' +
       "<label>Reason (optional)</label>" + '<input type="text" id="to-reason" value="' + esc(e.reason) + '" placeholder="e.g. family trip">' +
@@ -565,41 +740,43 @@
       e.reason = $("to-reason").value.trim();
       if (owner) {
         e.memberId = $("to-who").value;
-        e.status = "approved";
-        if (isNew) state.timeoff.push(e);
-        save();
+        if (isNew) e.status = "approved";
         closeModal();
-        toast("Time off saved ✳");
-        renderAll();
+        toOwnerUpsert(e, isNew).then(function () { if (!cloud) toast("Time off saved ✳"); else toast("Saved 🌴"); });
       } else {
         e.memberId = who;
         e.status = "requested";
-        if (isNew) state.timeoff.push(e);
-        save();
         closeModal();
-        var m = member(who);
-        var subject = "Time off request — " + (m ? m.full : "team");
-        var reqLink = location.origin + location.pathname + "?req=" +
-          encodeURIComponent(b64e(JSON.stringify({ m: who, s: start, e: end, r: e.reason })));
-        var body = "Hi Alise!\n\nI'd like to request time off:\n\nFrom: " + fmtDate(start) +
-          "\nThrough: " + fmtDate(end) +
-          (e.reason ? "\nReason: " + e.reason : "") +
-          "\n\nApprove or deny it here:\n" + reqLink +
-          "\n\nThank you!\n" + (m ? m.name : "");
-        window.location.href = "mailto:" + encodeURIComponent(state.settings.ownerEmail || "alise@claudeandco.design") +
-          "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
-        toast("Almost done — hit Send in the email that just opened ✉️");
-        renderAll();
+        toSubmitRequest(e).then(function () {
+          var m = member(who);
+          var subject = "Time off request — " + (m ? m.full : "team");
+          var body;
+          if (cloud) {
+            body = "Hi Alise!\n\nJust a heads-up — I submitted a time off request in Studio HQ:\n\nFrom: " + fmtDate(start) +
+              "\nThrough: " + fmtDate(end) +
+              (e.reason ? "\nReason: " + e.reason : "") +
+              "\n\nIt's waiting on your Team tab.\n\nThank you!\n" + (m ? m.name : "");
+            toast("Request sent 🌴 — an email heads-up just opened too");
+          } else {
+            var reqLink = location.origin + location.pathname + "?req=" +
+              encodeURIComponent(b64e(JSON.stringify({ m: who, s: start, e: end, r: e.reason })));
+            body = "Hi Alise!\n\nI'd like to request time off:\n\nFrom: " + fmtDate(start) +
+              "\nThrough: " + fmtDate(end) +
+              (e.reason ? "\nReason: " + e.reason : "") +
+              "\n\nApprove or deny it here:\n" + reqLink +
+              "\n\nThank you!\n" + (m ? m.name : "");
+            toast("Almost done — hit Send in the email that just opened ✉️");
+          }
+          window.location.href = "mailto:" + encodeURIComponent(state.settings.ownerEmail || "alise@claudeandco.design") +
+            "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+        });
       }
     });
     var del = $("to-del");
     if (del) del.addEventListener("click", function () {
       if (!confirm("Delete this time off entry?")) return;
-      state.timeoff = state.timeoff.filter(function (x) { return x.id !== e.id; });
-      save();
       closeModal();
-      toast("Deleted");
-      renderAll();
+      toDelete(e.id);
     });
   }
 
@@ -622,16 +799,10 @@
   }
   function bindTimeoffButtons(root) {
     root.querySelectorAll("[data-to-approve]").forEach(function (b) {
-      b.addEventListener("click", function () {
-        var e = state.timeoff.find(function (x) { return x.id === b.dataset.toApprove; });
-        if (e) { e.status = "approved"; save(); toast("Approved 🌴"); renderAll(); }
-      });
+      b.addEventListener("click", function () { toSetStatus(b.dataset.toApprove, "approved", "Approved 🌴"); });
     });
     root.querySelectorAll("[data-to-deny]").forEach(function (b) {
-      b.addEventListener("click", function () {
-        var e = state.timeoff.find(function (x) { return x.id === b.dataset.toDeny; });
-        if (e) { e.status = "denied"; save(); toast("Denied — let them know 💬"); renderAll(); }
-      });
+      b.addEventListener("click", function () { toSetStatus(b.dataset.toDeny, "denied", "Denied — let them know 💬"); });
     });
     root.querySelectorAll("[data-to-edit]").forEach(function (b) {
       b.addEventListener("click", function () { timeoffForm(b.dataset.toEdit); });
@@ -828,7 +999,7 @@
     var today = todayStr();
     var upcomingOff = state.timeoff
       .filter(function (e) { return e.end >= today; })
-      .sort(function (a, b) { return a.start.localeCompare(b.start); });
+      .sort(function (a, b) { return String(a.start).localeCompare(String(b.start)); });
 
     var html = "<h2>The team</h2>" +
       '<p class="view-sub">Who\'s carrying what, and how far along everyone is</p>';
@@ -958,6 +1129,7 @@
   }
 
   $("publish-btn").addEventListener("click", function () {
+    // Local-only mode fallback (cloud mode saves live and hides this button).
     state.publishedAt = Date.now();
     save();
     var out = JSON.parse(JSON.stringify(state));
@@ -969,7 +1141,6 @@
       "<p style='font-size:14px'>A file called <b>cco-hq-data.js</b> just downloaded. It has everything you changed.</p>" +
       "<p style='font-size:14px'>Now just tell Claude:</p>" +
       "<p style='background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:12px;font-weight:700'>“Publish my Studio HQ updates”</p>" +
-      "<p style='font-size:14px'>Claude grabs the file from Downloads, updates the site, and the whole team sees it after you push in GitHub Desktop.</p>" +
       '<div class="modal-actions"><button class="btn btn-gold" data-close>Got it</button></div>'
     );
   });
@@ -979,27 +1150,33 @@
       "<h3>Settings</h3>" +
       "<label>Studio password (whole team)</label>" +
       '<input type="text" id="st-access" value="' + esc(state.settings.accessCode) + '">' +
-      "<label>Owner PIN (just you)</label>" +
-      '<input type="text" id="st-pin" value="' + esc(state.settings.ownerPin) + '">' +
+      (cloud
+        ? '<p class="hint">Your owner password is managed in Supabase (Authentication → Users), not here.</p>'
+        : "<label>Owner PIN (just you)</label>" +
+          '<input type="text" id="st-pin" value="' + esc(state.settings.ownerPin) + '">') +
       "<label>Owner email (time-off requests go here)</label>" +
       '<input type="text" id="st-email" value="' + esc(state.settings.ownerEmail || "") + '">' +
-      '<p class="hint">If you change these, hit Publish so the live site gets the new ones — and tell the team the new password.</p>' +
+      (cloud
+        ? '<p class="hint">Changes save live for everyone — tell the team if you change the studio password.</p>'
+        : '<p class="hint">If you change these, hit Publish so the live site gets the new ones — and tell the team the new password.</p>') +
       '<div class="modal-actions">' +
         '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
         '<button class="btn btn-gold" id="st-save">Save</button>' +
       "</div>" +
       '<div class="danger-zone">' +
-        '<button class="btn-ghost" id="st-export">Download a backup</button><br>' +
-        '<button class="btn-ghost" id="st-reset">Reset my device to the published version</button>' +
+        '<button class="btn-ghost" id="st-export">Download a backup</button>' +
+        (cloud ? "" : '<br><button class="btn-ghost" id="st-reset">Reset my device to the published version</button>') +
       "</div>"
     );
     $("st-save").addEventListener("click", function () {
       var ac = $("st-access").value.trim();
-      var pin = $("st-pin").value.trim();
       var em = $("st-email").value.trim();
       if (ac) state.settings.accessCode = ac;
-      if (pin) state.settings.ownerPin = pin;
       if (em) state.settings.ownerEmail = em;
+      if (!cloud) {
+        var pin = $("st-pin").value.trim();
+        if (pin) state.settings.ownerPin = pin;
+      }
       save();
       closeModal();
       toast("Settings saved 🌸");
@@ -1008,7 +1185,8 @@
       download("cco-hq-backup.json", JSON.stringify(state, null, 2));
       toast("Backup downloaded");
     });
-    $("st-reset").addEventListener("click", function () {
+    var rst = $("st-reset");
+    if (rst) rst.addEventListener("click", function () {
       if (!confirm("Replace what's on this device with the published version?")) return;
       localStorage.removeItem(LS_STATE);
       state = loadState();
@@ -1018,7 +1196,7 @@
     });
   });
 
-  // ---------- incoming time-off request link (from the email) ----------
+  // ---------- incoming time-off request link (old emails, local mode) ----------
   function handleRequestLink() {
     var raw = new URLSearchParams(location.search).get("req");
     if (!raw) return;
@@ -1031,22 +1209,11 @@
 
     function decide(approve) {
       if (!isOwner()) { ownerLogin(function () { decide(approve); }); return; }
-      // If this exact request already exists (e.g. link opened twice), update it.
-      var existing = state.timeoff.find(function (x) {
-        return x.memberId === req.m && x.start === req.s && x.end === (req.e || req.s);
-      });
-      var entry = existing || { id: uid(), memberId: req.m, start: req.s, end: req.e || req.s, reason: req.r || "" };
-      entry.status = approve ? "approved" : "denied";
-      if (!existing) state.timeoff.push(entry);
-      save();
+      var entry = { id: uid(), memberId: req.m, start: req.s, end: req.e || req.s, reason: req.r || "", status: approve ? "approved" : "denied" };
       closeModal();
-      toast(approve ? "Approved 🌴 — it's on the schedule" : "Denied — let them know 💬");
-      activeTab = "team";
-      document.querySelectorAll("#tabs .tab").forEach(function (b) { b.classList.toggle("active", b.dataset.tab === "team"); });
-      ["today", "clients", "team", "schedule", "links"].forEach(function (v) {
-        $("view-" + v).classList.toggle("hidden", v !== "team");
+      toOwnerUpsert(entry, true).then(function () {
+        toast(approve ? "Approved 🌴 — it's on the schedule" : "Denied — let them know 💬");
       });
-      renderAll();
     }
 
     openModal(
@@ -1054,7 +1221,7 @@
       '<div class="timeoff-row"><span class="to-emoji">🌴</span>' + (m ? avatarHtml(m) : "") +
       "<span style='flex:1'><b>" + esc(name) + "</b> asks for " + fmtRange(req.s, req.e || req.s) +
       (req.r ? ' <span style="color:var(--muted)">· ' + esc(req.r) + "</span>" : "") + "</span></div>" +
-      "<p class='hint'>Approving puts it on the schedule for the whole team (after your next publish). You'll be asked for your PIN if Owner mode is off.</p>" +
+      "<p class='hint'>You'll be asked for your owner login if it's off.</p>" +
       '<div class="modal-actions">' +
         '<button class="btn btn-rust" id="req-deny">Deny</button>' +
         '<button class="btn btn-gold" id="req-approve">Approve 🌴</button>' +
@@ -1078,5 +1245,24 @@
 
   checkGate();
   renderAll();
-  handleRequestLink();
+
+  if (cloud) {
+    sb.auth.getSession().then(function (res) {
+      ownerFlag = !!(res.data && res.data.session);
+      renderAll();
+    });
+    sb.auth.onAuthStateChange(function (event, session) {
+      ownerFlag = !!session;
+      renderOwnerUI();
+    });
+    refreshCloud().then(handleRequestLink);
+    setInterval(function () {
+      if (document.visibilityState === "visible") refreshCloud();
+    }, 30000);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible") refreshCloud();
+    });
+  } else {
+    handleRequestLink();
+  }
 })();

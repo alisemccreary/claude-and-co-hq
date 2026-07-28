@@ -22,7 +22,17 @@ dependencies) so it deploys straight to Vercel.
   tasks — delete old done tasks now and then to keep the bars meaningful.
 - v2 look: blush pink + pine green (replaces the v1 charcoal/gold).
 
-## Where the data lives (important)
+## Cloud sync (v3)
+
+When `assets/config.js` holds real Supabase values, the app is cloud-synced:
+data lives in Supabase (`app_state` JSON row + `timeoff` table), owner edits
+save live for everyone (screens refresh on focus + every 30s), employees'
+time-off requests insert directly, and owner login is real Supabase auth
+(email + password, enforced server-side by RLS). The Publish-to-team flow
+disappears entirely in cloud mode. Without config values the app falls back
+to the local/publish model described below.
+
+## Where the data lives (local fallback mode)
 
 - `assets/data.js` is the **shared baseline** — what every device sees.
 - Alise's edits save in **her browser** (localStorage) on her device.
