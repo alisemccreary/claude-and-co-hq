@@ -171,18 +171,23 @@
   function mStaff(r) {
     return { memberId: r.member_id, rate: Number(r.hourly_rate) || 0, payType: r.pay_type || "hourly",
       phone: r.phone || "", address: r.address || "", emName: r.emergency_name || "", emPhone: r.emergency_phone || "",
-      startDate: r.start_date || "", birthday: r.birthday || "", notes: r.notes || "" };
+      startDate: r.start_date || "", birthday: r.birthday || "", notes: r.notes || "",
+      title: r.title || "", weeklyHours: Number(r.weekly_hours) || 0, share: r.share || {},
+      payFreq: r.pay_frequency || "biweekly", empType: r.employment_type || "employee" };
   }
   function staffRow(x) {
     return { member_id: x.memberId, hourly_rate: x.rate || 0, pay_type: x.payType || "hourly",
       phone: x.phone || "", address: x.address || "", emergency_name: x.emName || "", emergency_phone: x.emPhone || "",
       start_date: x.startDate || null, birthday: x.birthday || null, notes: x.notes || "",
       title: x.title || "", weekly_hours: x.weeklyHours || 0, share: x.share || {},
+      pay_frequency: x.payFreq || "biweekly", employment_type: x.empType || "employee",
       updated_at: new Date().toISOString() };
   }
   function hoursFor(id) { for (var i = 0; i < DB.hours.length; i++) if (DB.hours[i].taskId === id) return DB.hours[i].hours; return null; }
   function staffFor(id) { for (var i = 0; i < DB.staff.length; i++) if (DB.staff[i].memberId === id) return DB.staff[i]; return null; }
   function rateFor(id) { var x = staffFor(id); return x ? x.rate : null; }
+  var PAY_FREQ = { weekly: "Every week", biweekly: "Every 2 weeks", semimonthly: "Twice a month", monthly: "Monthly" };
+  var EMP_TYPE = { employee: "Employee", contractor: "Contractor", intern: "Intern" };
   function money(n) { return "$" + (Math.round(n * 100) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 
   function mAct(r) { return { id: r.id, actorId: r.actor_id, verb: r.verb, subject: r.subject, at: r.created_at }; }
@@ -1060,7 +1065,8 @@
           "<span>" + r.tasks + "</span>" +
           "<span>" + (Math.round(r.planned * 10) / 10) + "</span>" +
           "<span>" + (Math.round(r.done * 10) / 10) + "</span>" +
-          "<span>" + (r.rate == null ? '<i class="dim">not set</i>' : money(r.rate) + "/hr") + "</span>" +
+          "<span>" + (r.rate == null ? '<i class="dim">not set</i>' : money(r.rate) + "/hr" +
+            (staffFor(r.m.id) ? '<br><i class="dim">' + esc(PAY_FREQ[staffFor(r.m.id).payFreq || "biweekly"]) + "</i>" : "")) + "</span>" +
           "<span><b>" + (r.projected == null ? "—" : money(r.projected)) + "</b>" +
           (r.earned ? '<br><i class="dim">' + money(r.earned) + " earned</i>" : "") + "</span></div>";
       }).join("") + "</div>";
@@ -1412,7 +1418,10 @@
         .reduce(function (a, e) { return a + e.hours; }, 0);
       h += "<label>🔒 " + (self && !isOwner() ? "Your pay" : "Pay & hours") + "</label>" +
         "<div class='deets'>" +
-        "<div class='deet'><span>Rate</span><b>" + (priv && priv.rate ? money(priv.rate) + "/hr" : "not set") + "</b></div>" +
+        "<div class='deet'><span>" + (priv && priv.payType === "salary" ? "Salary" : "Rate") + "</span><b>" +
+          (priv && priv.rate ? money(priv.rate) + (priv.payType === "salary" ? "/yr" : "/hr") : "not set") + "</b></div>" +
+        "<div class='deet'><span>Paid</span><b>" + esc(PAY_FREQ[(priv && priv.payFreq) || "biweekly"]) + "</b></div>" +
+        "<div class='deet'><span>Type</span><b>" + esc(EMP_TYPE[(priv && priv.empType) || "employee"]) + "</b></div>" +
         "<div class='deet'><span>Hours logged</span><b>" + (Math.round(logged * 10) / 10) + "</b></div>" +
         (r ? "<div class='deet'><span>Scheduled (period)</span><b>" + (Math.round(r.planned * 10) / 10) + "</b></div>" : "") +
         (r && r.projected != null ? "<div class='deet'><span>Projected</span><b>" + money(r.projected) + "</b></div>" : "") +
@@ -1465,7 +1474,19 @@
       fieldRow("startDate", "Start date", "<input type='date' id='pe-start' value='" + esc(x.startDate || "") + "'>") +
       fieldRow("birthday", "Birthday", "<input type='date' id='pe-bday' value='" + esc(x.birthday || "") + "'>") +
       "<div class='lockbar'>🔒 Below is never shared with the team</div>" +
-      "<label>Hourly rate</label><input type='text' id='pe-rate' inputmode='decimal' value='" + esc(x.rate || "") + "'>" +
+      "<label>Employment type</label><select id='pe-emptype'>" + Object.keys(EMP_TYPE).map(function (k) {
+        return "<option value='" + k + "'" + (x.empType === k ? " selected" : "") + ">" + EMP_TYPE[k] + "</option>";
+      }).join("") + "</select>" +
+      "<label>How they're paid</label><select id='pe-paytype'>" +
+        ["hourly|Hourly", "salary|Salary", "contract|Per project"].map(function (o) {
+          var v = o.split("|");
+          return "<option value='" + v[0] + "'" + (x.payType === v[0] ? " selected" : "") + ">" + v[1] + "</option>";
+        }).join("") + "</select>" +
+      "<label>Pay frequency</label><select id='pe-freq'>" + Object.keys(PAY_FREQ).map(function (k) {
+        return "<option value='" + k + "'" + (x.payFreq === k ? " selected" : "") + ">" + PAY_FREQ[k] + "</option>";
+      }).join("") + "</select>" +
+      "<label>" + (x.payType === "salary" ? "Salary (per year)" : "Hourly rate") + "</label>" +
+      "<input type='text' id='pe-rate' inputmode='decimal' value='" + esc(x.rate || "") + "'>" +
       "<label>Usual hours a week</label><input type='text' id='pe-weekly' inputmode='decimal' value='" + esc(x.weeklyHours || "") + "'>" +
       "<label>Home address</label><input type='text' id='pe-address' value='" + esc(x.address) + "'>" +
       "<label>Emergency contact</label><div class='row2'>" +
@@ -1494,6 +1515,9 @@
       x.birthday = $("pe-bday").value || "";
       x.rate = parseFloat($("pe-rate").value) || 0;
       x.weeklyHours = parseFloat($("pe-weekly").value) || 0;
+      x.payFreq = $("pe-freq").value;
+      x.payType = $("pe-paytype").value;
+      x.empType = $("pe-emptype").value;
       x.address = $("pe-address").value.trim();
       x.emName = $("pe-emname").value.trim();
       x.emPhone = $("pe-emphone").value.trim();
