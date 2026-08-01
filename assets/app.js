@@ -30,7 +30,7 @@
   var DB = { members: [], clients: [], tasks: [], links: [], timeoff: [], comments: [], activity: [], settings: {} };
   var me = { userId: null, memberId: null, role: null };
   var who = localStorage.getItem(LS_WHO) || "alise";
-  var view = "today";
+  var view = null;   // resolved at boot: owners land on Today, the team on My work
   var mineOnly = false;
   var connected = false;
   var loaded = false;
@@ -83,8 +83,11 @@
   function isOwner() { return me.role === "owner"; }
   function canCheck(t) {
     if (isOwner()) return true;
-    return me.role === "employee" && t.assigneeId === me.memberId && !!DB.settings.employeesCanCheck;
+    return me.role === "employee" && t.assigneeId === me.memberId &&
+      DB.settings.employeesCanCheck !== false;
   }
+  // Shown-but-not-yet-permitted: it is their task, they just have no login yet.
+  function isMine(t) { return t.assigneeId === viewerId(); }
   function statusLabel(s) { return s === "archived" ? "past client" : s; }
 
   function toast(msg, bad) {
@@ -108,7 +111,15 @@
     chat:    '<svg viewBox="0 0 24 24"><path d="M20 15a2 2 0 01-2 2H8l-4 4V5a2 2 0 012-2h12a2 2 0 012 2z"/></svg>',
     plus:    '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>'
   };
-  var NAV = [
+  var STATUS = {
+    todo:       { label: "To do",       verb: "To do",     color: "#b0a8a4" },
+    inprogress: { label: "In progress", verb: "Working",   color: "#d98f2b" },
+    needhelp:   { label: "Needs help",  verb: "Need help", color: "#c2553f" },
+    done:       { label: "Done",        verb: "Done",      color: "#4f7460" }
+  };
+  function sLabel(s) { return (STATUS[s] || STATUS.todo).label; }
+
+  var NAV_OWNER = [
     { id: "today",   label: "Today",    icon: "today" },
     { id: "board",   label: "Board",    icon: "board" },
     { id: "clients", label: "Clients",  icon: "clients" },
@@ -116,7 +127,16 @@
     { id: "sched",   label: "Schedule", icon: "sched" },
     { id: "links",   label: "Links",    icon: "links" }
   ];
-  var TITLES = { today: "Today", board: "Board", clients: "Clients", team: "Team", sched: "Schedule", links: "Studio links" };
+  var NAV_TEAM = [
+    { id: "mywork",  label: "My work",  icon: "today" },
+    { id: "team",    label: "The team", icon: "team" },
+    { id: "sched",   label: "Schedule", icon: "sched" },
+    { id: "links",   label: "Links",    icon: "links" }
+  ];
+  function nav() { return isOwner() ? NAV_OWNER : NAV_TEAM; }
+  var TITLES = { today: "Today", mywork: "My work", board: "Board", clients: "Clients", team: "The team", sched: "Schedule", links: "Studio links" };
+  // Who the viewer is acting as: their login if they have one, else the picker.
+  function viewerId() { return me.memberId || who; }
 
   /* ══════════ row mappers ══════════ */
   function mMember(r) { return { id: r.id, name: r.name, full: r.full_name || r.name, role: r.role || "", color: r.color || "#c4667c", email: r.email || "", info: r.info || "", isOwner: !!r.is_owner, sort: r.sort || 0 }; }
@@ -258,17 +278,38 @@
 
   /* ══════════ status toggle (targeted, no full re-render) ══════════ */
   function cycle(s) { return s === "todo" ? "inprogress" : s === "inprogress" ? "done" : "todo"; }
-  function toggleStatus(id) {
-    var t = task(id); if (!t || !canCheck(t)) return;
-    t.status = cycle(t.status);
-    t.completedAt = t.status === "done" ? new Date().toISOString() : null;
-    patchTaskNodes(t);
-    patchProgress();
-    if (t.status === "done") logAct("completed", t.title);
+
+  function setStatus(id, status) {
+    var t = task(id); if (!t) return;
+    if (!canCheck(t)) {
+      if (isMine(t) && !me.role) return needLogin(t);   // their task, no login yet
+      return toast("Only Alise can change this one", true);
+    }
+    if (t.status === status) return;
+    t.status = status;
+    t.completedAt = status === "done" ? new Date().toISOString() : null;
+    scheduleRender();
+    if (status === "done") logAct("completed", t.title);
+    if (status === "needhelp") logAct("flagged for help on", t.title);
     if (!cloudReady) return;
     sb.from("tasks").update({ status: t.status, completed_at: t.completedAt }).eq("id", t.id).select("id")
       .then(function (r) { wrote(r, "Couldn't update — are you still signed in?"); });
   }
+  function needLogin(t) {
+    var m = member(t.assigneeId);
+    openModal("<h3>Sign in to update your tasks</h3>" +
+      "<div class='modal-sub'>This is your task, " + esc(m ? m.name : "") +
+      " — you just need a login so the studio knows it's you.</div>" +
+      "<div class='hint'>Ask Alise to set one up. Until then she can mark it off for you.</div>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Close</button>" +
+      "<button class='btn btn-primary' id='nl-go'>I have a login</button></div>");
+    $("nl-go").addEventListener("click", function () { closeModal(); login(); });
+  }
+  function toggleStatus(id) {
+    var t = task(id); if (!t) return;
+    setStatus(id, cycle(t.status));
+  }
+
   function patchTaskNodes(t) {
     document.querySelectorAll('[data-task="' + t.id + '"]').forEach(function (node) {
       node.classList.toggle("is-done", t.status === "done");
@@ -316,25 +357,50 @@
   }
   function taskHTML(t, opt) {
     opt = opt || {};
-    var m = member(t.assigneeId), c = client(t.clientId), bits = [];
-    if (!opt.hideClient && c) bits.push("<b>" + esc(c.name) + "</b>");
-    if (t.due) bits.push((isOverdue(t) ? '<span class="pill overdue">late</span> ' : "") + fDate(t.due) + (t.time ? " · " + fTime(t.time) : ""));
-    if (t.kind === "shoot") bits.push('<span class="pill shoot">📷 shoot</span>');
-    if (t.location) bits.push("📍 " + esc(t.location));
-    if (m && !opt.hideWho) bits.push('<span class="who" style="color:' + esc(m.color) + '">' + esc(m.name) + "</span>");
-    bits.push('<span class="pill status-pill ' + t.status + '">' + (t.status === "inprogress" ? "in progress" : t.status === "todo" ? "to do" : "done") + "</span>");
+    var m = member(t.assigneeId), c = client(t.clientId);
+    var late = isOverdue(t);
     var n = DB.comments.filter(function (x) { return x.taskId === t.id; }).length;
-    return '<div class="task' + (opt.nested ? " nested" : "") + (t.status === "done" ? " is-done" : "") + '" data-task="' + esc(t.id) + '">' +
-      '<button class="check ' + t.status + '" data-toggle="' + esc(t.id) + '"' + (canCheck(t) ? "" : " disabled") +
-        ' aria-label="Change status">' + (t.status === "done" ? ICON.check : "") + "</button>" +
-      '<div class="task-main"><div class="task-title">' + esc(t.title) + "</div>" +
-      '<div class="task-meta">' + bits.join(" ") + "</div>" +
-      (t.notes ? '<div class="task-note">' + esc(t.notes) + "</div>" : "") + "</div>" +
-      '<div class="task-tools">' +
-        '<button class="mini-btn" data-open="' + esc(t.id) + '" title="Comments">' + ICON.chat + (n ? '<span class="cnt">' + n + "</span>" : "") + "</button>" +
-        (isOwner() ? '<button class="mini-btn" data-edit="' + esc(t.id) + '" title="Edit">' + ICON.edit + "</button>" : "") +
+    var mine = isMine(t), actionable = canCheck(t) || (mine && !isOwner());
+
+    var meta = [];
+    if (m && !opt.hideWho) meta.push('<span class="tc-who">' + avatar(m, "sm") + esc(m.name) + "</span>");
+    if (t.due) meta.push('<span' + (late ? ' class="tc-late"' : "") + ">" + (late ? "⚠ " : "") + fDate(t.due) + (t.time ? " · " + fTime(t.time) : "") + "</span>");
+    if (t.kind === "shoot") meta.push('<span class="tc-tag">📷 Photoshoot</span>');
+    if (t.location) meta.push("<span>📍 " + esc(t.location) + "</span>");
+
+    var acts = "";
+    if (actionable && !opt.flat) {
+      acts = '<div class="tc-actions">' +
+        ["inprogress", "needhelp", "done"].map(function (st) {
+          if (t.status === st) return "";
+          return '<button class="tc-act a-' + st + '" data-set="' + st + '|' + esc(t.id) + '">' + STATUS[st].verb + "</button>";
+        }).join("") +
+        (t.status !== "todo" ? '<button class="tc-act a-todo" data-set="todo|' + esc(t.id) + '">Reset</button>' : "") +
+        '<button class="tc-act a-chat" data-open="' + esc(t.id) + '">💬' + (n ? " " + n : "") + "</button>" +
+        (isOwner() ? '<button class="tc-act a-edit" data-edit="' + esc(t.id) + '">Edit</button>' : "") +
+        "</div>";
+    } else {
+      acts = '<div class="tc-actions">' +
+        '<button class="tc-act a-chat" data-open="' + esc(t.id) + '">💬' + (n ? " " + n : "") + "</button>" +
+        (isOwner() ? '<button class="tc-act a-edit" data-edit="' + esc(t.id) + '">Edit</button>' : "") +
+        "</div>";
+    }
+
+    return '<div class="tcard s-' + t.status + (t.status === "done" ? " is-done" : "") + (late ? " is-late" : "") +
+      '" data-task="' + esc(t.id) + '">' +
+      '<span class="tc-bar"></span>' +
+      '<div class="tc-body">' +
+        '<div class="tc-top">' +
+          (!opt.hideClient && c ? '<span class="tc-client">' + esc(c.name) + "</span>" : "<span></span>") +
+          '<span class="pill status-pill ' + t.status + '">' + sLabel(t.status) + "</span>" +
+        "</div>" +
+        '<div class="tc-title">' + esc(t.title) + "</div>" +
+        (meta.length ? '<div class="tc-meta">' + meta.join("") + "</div>" : "") +
+        (t.notes ? '<div class="tc-note">' + esc(t.notes) + "</div>" : "") +
+        acts +
       "</div></div>";
   }
+
   function sortT(list) {
     return list.slice().sort(function (a, b) {
       return String(a.due || "9999").localeCompare(String(b.due || "9999")) ||
@@ -350,13 +416,16 @@
   /* ══════════ views ══════════ */
   function render() {
     if (!loaded) return;
+    var allowed = nav().map(function (n) { return n.id; });
+    if (allowed.indexOf(view) < 0) view = allowed[0];
     $("skeleton").classList.add("hidden");
     $("view").classList.remove("hidden");
     $("topbar-title").textContent = TITLES[view];
     $("fab").classList.toggle("hidden", !isOwner() || view === "links");
     paintNav(); paintOwnerBar(); paintWho();
     var v = $("view");
-    if (view === "today") v.innerHTML = viewToday();
+    if (view === "mywork") v.innerHTML = viewMyWork();
+    else if (view === "today") v.innerHTML = viewToday();
     else if (view === "board") v.innerHTML = viewBoard();
     else if (view === "clients") v.innerHTML = viewClients();
     else if (view === "team") v.innerHTML = viewTeam();
@@ -373,6 +442,7 @@
     var prog = pool.filter(function (t) { return t.status === "inprogress"; });
     var shoots = sortT(pool.filter(function (t) { return t.kind === "shoot" && t.status !== "done" && t.due >= td && t.due <= addDays(7); }));
     var pending = DB.timeoff.filter(function (e) { return e.status === "requested"; });
+    var helpNeeded = sortT(pool.filter(function (t) { return t.status === "needhelp"; }));
 
     var h = '<div class="page-head"><h2>' + greet() + ", " + esc(m ? m.name : "there") + " 🌸</h2>" +
       '<div class="page-sub">' + new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }) + "</div></div>";
@@ -392,6 +462,10 @@
     h += progCard(m ? m.name : "You", live().filter(function (t) { return t.assigneeId === who; }), who, m);
     h += progCard("The whole team", live(), "team", null);
 
+    if (helpNeeded.length) {
+      h += '<div class="section"><h3>🙋 Someone needs help</h3></div>' +
+        helpNeeded.map(function (t) { return taskHTML(t); }).join("");
+    }
     if (isOwner() && pending.length) {
       h += '<div class="section"><h3>Waiting on you</h3></div>';
       h += pending.map(offHTML).join("");
@@ -421,10 +495,51 @@
     return h;
   }
 
+  function viewMyWork() {
+    var id = viewerId(), m = member(id), td = today();
+    var all = live().filter(function (t) { return t.assigneeId === id; });
+    var open = all.filter(function (t) { return t.status !== "done"; });
+    var over = sortT(open.filter(isOverdue));
+    var todayT = sortT(open.filter(function (t) { return t.due === td; }));
+    var week = sortT(open.filter(function (t) { return t.due > td && t.due <= addDays(7); }));
+    var later = sortT(open.filter(function (t) { return !t.due || t.due > addDays(7); }));
+    var doneRecent = sortT(all.filter(function (t) { return t.status === "done"; })).slice(-5).reverse();
+    var help = open.filter(function (t) { return t.status === "needhelp"; });
+    var offToday = DB.timeoff.filter(function (e) { return e.memberId === id && e.status === "approved" && e.start <= td && e.end >= td; });
+
+    var h = '<div class="page-head"><h2>' + greet() + ", " + esc(m ? m.name : "there") + " 🌸</h2>" +
+      '<div class="page-sub">' + new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }) + "</div></div>";
+
+    if (offToday.length) h += '<div class="banner good">🌴 You\'re booked off today — enjoy it.</div>';
+    if (!me.role) h += '<div class="banner">👋 Viewing as <b>' + esc(m ? m.name : "") +
+      '</b>. <button class="linkish" data-whopick>Not you?</button> Sign in to tick off your own tasks.</div>';
+    if (help.length) h += '<div class="banner warn">🙋 You flagged ' + help.length + " task" + (help.length === 1 ? "" : "s") + " for help — Alise can see it.</div>";
+
+    h += progCard("Your progress", all, id, m);
+
+    h += '<div class="stats" style="margin-top:14px">' +
+      '<div class="stat ' + (over.length ? "late" : "good") + '"><div class="n">' + over.length + '</div><div class="l">Overdue</div></div>' +
+      '<div class="stat warm"><div class="n">' + todayT.length + '</div><div class="l">Due today</div></div>' +
+      '<div class="stat"><div class="n">' + week.length + '</div><div class="l">This week</div></div>' +
+      '<div class="stat good"><div class="n">' + all.filter(function (t) { return t.status === "done"; }).length + '</div><div class="l">Done</div></div></div>';
+
+    function block(title, list, emptyMsg) {
+      if (!list.length) return emptyMsg ? '<div class="section"><h3>' + title + "</h3></div><div class='empty'>" + emptyMsg + "</div>" : "";
+      return '<div class="section"><h3>' + title + "</h3></div>" + list.map(function (t) { return taskHTML(t, { hideWho: true }); }).join("");
+    }
+    h += block("⚠ Overdue", over);
+    h += block("Today", todayT, "Nothing due today.");
+    h += block("This week", week);
+    h += block("Later", later);
+    if (doneRecent.length) h += block("Recently finished", doneRecent);
+    return h;
+  }
+
   var COLS = [
-    { id: "todo", label: "To do", color: "#b9b1ad" },
-    { id: "inprogress", label: "In progress", color: "#d98f2b" },
-    { id: "done", label: "Done", color: "#4f7460" }
+    { id: "todo", label: "To do" },
+    { id: "inprogress", label: "In progress" },
+    { id: "needhelp", label: "Needs help" },
+    { id: "done", label: "Done" }
   ];
   function viewBoard() {
     var pool = mineOnly ? live().filter(function (t) { return t.assigneeId === who; }) : live();
@@ -438,7 +553,7 @@
     COLS.forEach(function (col) {
       var items = sortT(pool.filter(function (t) { return t.status === col.id; }));
       h += '<div class="col" data-col="' + col.id + '"><div class="col-head">' +
-        '<span class="col-dot" style="background:' + col.color + '"></span><h4>' + col.label + "</h4>" +
+        '<span class="col-dot" style="background:' + STATUS[col.id].color + '"></span><h4>' + col.label + "</h4>" +
         '<span class="col-count">' + items.length + "</span></div>";
       h += items.map(bcardHTML).join("");
       if (!items.length) h += '<div class="empty" style="padding:16px 10px;margin:0">Nothing here</div>';
@@ -497,12 +612,18 @@
     DB.members.forEach(function (m) {
       var all = live().filter(function (t) { return t.assigneeId === m.id; });
       var open = sortT(all.filter(function (t) { return t.status !== "done"; }));
-      h += '<div class="card"><div class="card-head">' +
-        '<div style="display:flex;align-items:center;gap:11px;min-width:0">' + avatar(m, "lg") +
-        '<div style="min-width:0"><h3 class="card-title">' + esc(m.full) + "</h3>" +
-        '<div class="card-sub">' + esc(m.role || "—") + "</div></div></div>" +
-        '<div style="display:flex;align-items:center;gap:5px"><span class="pill todo">' + open.length + " open</span>" +
-        (isOwner() ? '<button class="mini-btn" data-editmember="' + esc(m.id) + '">' + ICON.edit + "</button>" : "") + "</div></div>";
+      var help = open.filter(function (t) { return t.status === "needhelp"; }).length;
+      var lateN = open.filter(isOverdue).length;
+      h += '<div class="card"><div class="person-head">' + avatar(m, "lg") +
+        '<div class="who-meta"><h3>' + esc(m.full) + (m.id === viewerId() ? ' <span class="pill active">you</span>' : "") + "</h3>" +
+        '<div class="card-sub">' + esc(m.role || "—") + "</div></div>" +
+        '<div style="display:flex;align-items:center;gap:5px;flex-shrink:0">' +
+        (help ? '<span class="pill needhelp">' + help + " need help</span>" : "") +
+        (lateN ? '<span class="pill overdue">' + lateN + " late</span>" : "") +
+        '<span class="pill todo">' + open.length + " open</span>" +
+        (isOwner() ? '<button class="mini-btn" data-editmember="' + esc(m.id) + '">' + ICON.edit + "</button>" : "") +
+        (isOwner() ? '<button class="mini-btn" data-assignto="' + esc(m.id) + '" title="Assign a task">' + ICON.plus + "</button>" : "") +
+        "</div></div>";
       if (m.email) h += '<div class="row" style="margin-top:8px"><a href="mailto:' + esc(m.email) + '">' + esc(m.email) + "</a></div>";
       if (m.info) h += '<div class="note">' + esc(m.info) + "</div>";
       h += '<div style="margin-top:11px">' + progCard(m.name, all, m.id, null) + "</div>";
@@ -579,9 +700,14 @@
   function paintNav() {
     var pending = DB.timeoff.filter(function (e) { return e.status === "requested"; }).length;
     var over = live().filter(isOverdue).length;
-    $("nav-items").innerHTML = NAV.map(function (n) {
+    var needHelp = live().filter(function (t) { return t.status === "needhelp"; }).length;
+    $("nav-items").innerHTML = nav().map(function (n) {
       var badge = "";
-      if (n.id === "today" && over) badge = '<span class="nav-badge">' + over + "</span>";
+      if (n.id === "today" && (over + needHelp)) badge = '<span class="nav-badge">' + (over + needHelp) + "</span>";
+      if (n.id === "mywork") {
+        var mineOpen = live().filter(function (t) { return t.assigneeId === viewerId() && t.status !== "done"; }).length;
+        if (mineOpen) badge = '<span class="nav-badge">' + mineOpen + "</span>";
+      }
       if (n.id === "team" && pending && isOwner()) badge = '<span class="nav-badge">' + pending + "</span>";
       return '<button class="nav-item' + (view === n.id ? " on" : "") + '" data-nav="' + n.id + '">' +
         ICON[n.icon] + "<span>" + n.label + "</span>" + badge + "</button>";
@@ -652,48 +778,58 @@
   function taskForm(id, preset) {
     var t = id ? task(id) : null, isNew = !t;
     t = t ? JSON.parse(JSON.stringify(t)) : {
-      id: uid(), clientId: (preset && preset.clientId) || (DB.clients[0] || {}).id || "", title: "",
-      assigneeId: me.memberId || who, due: (preset && preset.due) || today(), time: "",
+      id: uid(), clientId: (preset && preset.clientId) || "", title: "",
+      assigneeId: (preset && preset.assigneeId) || me.memberId || who, due: (preset && preset.due) || today(), time: "",
       status: "todo", kind: (preset && preset.kind) || "task", location: "", notes: "", sort: Date.now() % 100000
     };
     openModal(
-      "<h3>" + (isNew ? "New task" : "Edit task") + "</h3>" +
-      "<label>What needs doing?</label><input type='text' id='f-title' value='" + esc(t.title) + "' placeholder='e.g. Draft captions'>" +
-      "<label>Type</label>" + segHTML("f-kind", [{ v: "task", l: "✓ Task" }, { v: "shoot", l: "📷 Photoshoot" }], t.kind) +
-      "<label>Client</label><select id='f-client'><option value=''>— none —</option>" +
+      "<h3>" + (isNew ? "Assign a task" : "Edit task") + "</h3>" +
+      (isNew ? "<div class='modal-sub'>It appears under their name on the Team tab and on their own My-work screen.</div>" : "") +
+      "<label>1 · What needs doing?</label><input type='text' id='f-title' value='" + esc(t.title) + "' placeholder='e.g. Draft this week&#39;s captions'>" +
+      "<label>2 · Who's doing it?</label>" +
+      "<div class='pickers' id='f-whopick'>" + DB.members.map(function (mm) {
+        return "<button data-v='" + esc(mm.id) + "' class='picker" + (mm.id === t.assigneeId ? " on" : "") + "'>" +
+          avatar(mm, "sm") + "<span>" + esc(mm.name) + "</span></button>";
+      }).join("") + "</div>" +
+      "<label>3 · Type</label>" + segHTML("f-kind", [{ v: "task", l: "✓ Task" }, { v: "shoot", l: "📷 Photoshoot" }], t.kind) +
+      "<label>4 · Which client?</label><select id='f-client'><option value=''>— none / internal —</option>" +
         DB.clients.filter(function (c) { return c.status !== "archived"; }).map(function (c) {
           return "<option value='" + esc(c.id) + "'" + (c.id === t.clientId ? " selected" : "") + ">" + esc(c.name) + "</option>";
         }).join("") + "</select>" +
-      "<label>Assigned to</label><select id='f-who'>" + DB.members.map(function (m) {
-        return "<option value='" + esc(m.id) + "'" + (m.id === t.assigneeId ? " selected" : "") + ">" + esc(m.name) + "</option>";
-      }).join("") + "</select>" +
-      "<label>Due</label><input type='date' id='f-due' value='" + esc(t.due) + "'>" +
+      "<label>5 · Due</label><input type='date' id='f-due' value='" + esc(t.due) + "'>" +
       "<div id='f-shoot' class='" + (t.kind === "shoot" ? "" : "hidden") + "'>" +
         "<label>Time</label><input type='time' id='f-time' value='" + esc(t.time) + "'>" +
         "<label>Location</label><input type='text' id='f-loc' value='" + esc(t.location) + "'>" + "</div>" +
-      "<label>Status</label>" + segHTML("f-status", [{ v: "todo", l: "To do" }, { v: "inprogress", l: "In progress" }, { v: "done", l: "Done" }], t.status) +
-      "<label>Notes</label><textarea id='f-notes'>" + esc(t.notes) + "</textarea>" +
+      "<label>Status</label>" + segHTML("f-status", [{ v: "todo", l: "To do" }, { v: "inprogress", l: "In progress" }, { v: "needhelp", l: "Needs help" }, { v: "done", l: "Done" }], t.status) +
+      "<label>Notes for them</label><textarea id='f-notes' placeholder='Anything they need to know — links, context, who to ask'>" + esc(t.notes) + "</textarea>" +
       "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
       "<button class='btn btn-primary' id='f-save'>" + (isNew ? "Add task" : "Save") + "</button></div>" +
       (isNew ? "" : "<div class='danger-zone'><button class='btn btn-danger' id='f-del'>Delete task</button></div>")
     );
-    var kind = t.kind, status = t.status;
+    var kind = t.kind, status = t.status, assignee = t.assigneeId;
     wireSeg("f-kind", function (v) { kind = v; $("f-shoot").classList.toggle("hidden", v !== "shoot"); });
     wireSeg("f-status", function (v) { status = v; });
+    $("f-whopick").querySelectorAll(".picker").forEach(function (b) {
+      b.addEventListener("click", function () {
+        assignee = b.getAttribute("data-v");
+        $("f-whopick").querySelectorAll(".picker").forEach(function (x) { x.classList.toggle("on", x === b); });
+      });
+    });
     $("f-title").focus();
     $("f-save").addEventListener("click", function () {
       var title = $("f-title").value.trim();
       if (!title) return $("f-title").focus();
       t.title = title; t.kind = kind; t.status = status;
-      t.clientId = $("f-client").value; t.assigneeId = $("f-who").value; t.due = $("f-due").value;
+      t.clientId = $("f-client").value; t.assigneeId = assignee; t.due = $("f-due").value;
       t.time = kind === "shoot" ? $("f-time").value : "";
       t.location = kind === "shoot" ? $("f-loc").value.trim() : "";
       t.notes = $("f-notes").value.trim();
       t.completedAt = status === "done" ? new Date().toISOString() : null;
       closeModal();
       upsert("tasks", taskRow(t), t, "tasks");
-      logAct(isNew ? "added" : "updated", t.title);
-      toast(isNew ? "Added ✳" : "Saved ✳");
+      logAct(isNew ? "assigned" : "updated", t.title);
+      var am = member(t.assigneeId);
+      toast(isNew ? "Assigned to " + (am ? am.name : "the team") + " ✳" : "Saved ✳");
     });
     if (!isNew) $("f-del").addEventListener("click", function () {
       if (!confirm("Delete this task?")) return;
@@ -1150,6 +1286,11 @@
     var hit;
     if ((hit = t.closest("[data-nav]"))) return go(hit.getAttribute("data-nav"));
     if ((hit = t.closest("[data-toggle]"))) { ev.stopPropagation(); return toggleStatus(hit.getAttribute("data-toggle")); }
+    if ((hit = t.closest("[data-set]"))) {
+      ev.stopPropagation();
+      var parts = hit.getAttribute("data-set").split("|");
+      return setStatus(parts[1], parts[0]);
+    }
     if ((hit = t.closest("[data-open]"))) { ev.stopPropagation(); return taskDetail(hit.getAttribute("data-open")); }
     if ((hit = t.closest("[data-edit]"))) { ev.stopPropagation(); return taskForm(hit.getAttribute("data-edit")); }
     if ((hit = t.closest("[data-client]"))) return clientDetail(hit.getAttribute("data-client"));
@@ -1159,6 +1300,7 @@
     if ((hit = t.closest("[data-approve]"))) return decideOff(hit.getAttribute("data-approve"), "approved");
     if ((hit = t.closest("[data-deny]"))) return decideOff(hit.getAttribute("data-deny"), "denied");
     if ((hit = t.closest("[data-mine]"))) { mineOnly = hit.getAttribute("data-mine") === "1"; return render(); }
+    if ((hit = t.closest("[data-assignto]"))) return taskForm(null, { assigneeId: hit.getAttribute("data-assignto") });
     if (t.closest("[data-newclient]")) return clientForm(null);
     if (t.closest("[data-newmember]")) return memberForm(null);
     if (t.closest("[data-newlink]")) return linkForm(null);
@@ -1277,6 +1419,7 @@
         loaded = true;
         if (!DB.members.length) seedFromFile();
         if (me.memberId) who = me.memberId;
+        if (!view) view = isOwner() ? "today" : "mywork";
         paintConnection();
         render();
         subscribe();

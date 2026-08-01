@@ -36,6 +36,8 @@
   --done-bg:   #e8f0e8;
   --late:      #c4667c;
   --late-bg:   #fbe4e8;
+  --help:      #c2553f;
+  --help-bg:   #fbe7e0;
 
   --r:   12px;
   --r-lg: 16px;
@@ -336,6 +338,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .pill.done     { background: var(--done-bg); color: var(--done); }
 .pill.overdue  { background: var(--late-bg); color: var(--late); }
 .pill.shoot    { background: var(--pine); color: var(--pink); }
+.pill.needhelp { background: var(--help-bg); color: var(--help); }
 .pill.approved { background: var(--done-bg); color: var(--done); }
 .pill.requested{ background: var(--prog-bg); color: var(--prog); }
 .pill.denied   { background: var(--surface-2); color: var(--muted); }
@@ -713,3 +716,92 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+
+/* ═══════════ task cards (v4.1) ═══════════ */
+.tcard {
+  display: flex; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--r);
+  box-shadow: var(--sh); margin-bottom: 9px; overflow: hidden;
+  transition: border-color .14s var(--ease), box-shadow .14s var(--ease), opacity .2s var(--ease);
+}
+.tcard:hover { border-color: #ddd0cd; box-shadow: var(--sh-md); }
+.tc-bar { width: 5px; flex-shrink: 0; background: var(--todo); }
+.tcard.s-inprogress .tc-bar { background: var(--prog); }
+.tcard.s-needhelp   .tc-bar { background: var(--help); }
+.tcard.s-done       .tc-bar { background: var(--done); }
+.tcard.is-late      { border-color: #f0cdd5; }
+.tcard.is-late .tc-bar { background: var(--late); }
+.tcard.is-done { opacity: .6; }
+.tcard.is-done .tc-title { text-decoration: line-through; }
+
+.tc-body { flex: 1; min-width: 0; padding: 12px 14px 11px; }
+.tc-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+.tc-client {
+  font-size: 10.5px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--rose); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tc-title { font-size: 15.5px; font-weight: 600; line-height: 1.35; color: var(--ink); }
+.tc-meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+  margin-top: 8px; font-size: 12.5px; color: var(--muted);
+}
+.tc-who { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; color: var(--ink-2); }
+.tc-late { color: var(--late); font-weight: 700; }
+.tc-tag { font-weight: 600; }
+.tc-note {
+  font-size: 13px; color: var(--ink-2); background: var(--surface-2);
+  border-radius: 8px; padding: 8px 10px; margin-top: 9px;
+  white-space: pre-wrap; line-height: 1.45;
+}
+.tc-actions {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px;
+  padding-top: 10px; border-top: 1px solid var(--line-soft);
+}
+.tc-act {
+  border: 1px solid var(--line); background: var(--surface);
+  border-radius: 999px; padding: 6px 13px; cursor: pointer;
+  font-size: 12.5px; font-weight: 700; color: var(--ink-2);
+  transition: background .13s var(--ease), color .13s var(--ease), border-color .13s var(--ease), transform .08s var(--ease);
+}
+.tc-act:active { transform: scale(.95); }
+.tc-act.a-inprogress:hover { background: var(--prog-bg); color: var(--prog); border-color: #f0d9ae; }
+.tc-act.a-needhelp:hover   { background: var(--help-bg); color: var(--help); border-color: #f0cbbc; }
+.tc-act.a-done:hover       { background: var(--done-bg); color: var(--done); border-color: #cfe2d2; }
+.tc-act.a-todo, .tc-act.a-chat, .tc-act.a-edit { color: var(--muted); }
+.tc-act.a-todo:hover, .tc-act.a-chat:hover, .tc-act.a-edit:hover { background: var(--surface-2); color: var(--ink); }
+.tc-act.a-chat { margin-left: auto; }
+
+/* banners */
+.banner {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  background: var(--surface); border: 1px solid var(--line);
+  border-left: 4px solid var(--pink);
+  border-radius: var(--r); padding: 11px 14px; margin-bottom: 12px;
+  font-size: 13.5px; color: var(--ink-2);
+}
+.banner.good { border-left-color: var(--sage); background: var(--done-bg); color: var(--done); }
+.banner.warn { border-left-color: var(--help); background: var(--help-bg); color: var(--help); }
+.linkish {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--rose); font-weight: 700; text-decoration: underline; font-size: inherit;
+}
+
+/* person pickers in the assign form */
+.pickers { display: flex; flex-wrap: wrap; gap: 7px; }
+.picker {
+  display: inline-flex; align-items: center; gap: 7px;
+  border: 1px solid var(--line); background: var(--surface);
+  border-radius: 999px; padding: 5px 13px 5px 5px; cursor: pointer;
+  font-size: 13.5px; font-weight: 700; color: var(--ink-2);
+  transition: background .13s var(--ease), border-color .13s var(--ease), color .13s var(--ease);
+}
+.picker:hover { border-color: var(--rose); }
+.picker.on { background: var(--pine); color: #fff; border-color: var(--pine); }
+
+/* team tab: tasks grouped under each person */
+.person-head {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+}
+.person-head .who-meta { min-width: 0; flex: 1; }
+.person-head h3 { font-size: 17px; }
