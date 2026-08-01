@@ -285,7 +285,10 @@
   function patchProgress() {
     document.querySelectorAll("[data-prog]").forEach(function (node) {
       var scope = node.getAttribute("data-prog");
-      var list = scope === "team" ? live() : live().filter(function (t) { return t.assigneeId === scope; });
+      var list = scope === "team" ? live()
+        : scope.indexOf("client-") === 0
+          ? live().filter(function (t) { return t.clientId === scope.slice(7); })
+          : live().filter(function (t) { return t.assigneeId === scope; });
       var p = pct(list);
       var fill = node.querySelector(".bar-fill"), lab = node.querySelector(".prog-pct"), sub = node.querySelector(".prog-sub");
       if (fill) { fill.style.width = p.pct + "%"; fill.classList.toggle("full", p.full); }
