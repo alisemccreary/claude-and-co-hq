@@ -28,7 +28,7 @@
 
   /* ── local mirror of the database ── */
   var DB = { members: [], clients: [], tasks: [], links: [], timeoff: [], comments: [], activity: [], settings: {},
-             hours: [], staff: [] };   // hours + staff are private: the server only sends what you may see
+             hours: [], staff: [], time: [] };  // hours/staff/time are private: the server only sends what you may see
   var me = { userId: null, memberId: null, role: null };
   var who = localStorage.getItem(LS_WHO) || "alise";
   var view = null;   // resolved at boot: owners land on Today, the team on My work
@@ -60,6 +60,9 @@
     if (s === addDays(1)) return "Tomorrow";
     if (s === addDays(-1)) return "Yesterday";
     return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }
+  function fPlain(s) {
+    var d = pDate(s); return d ? d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
   }
   function fDow(s) { var d = pDate(s); return d ? d.toLocaleDateString("en-US", { weekday: "long" }) : ""; }
   function fTime(t) {
@@ -144,13 +147,22 @@
   function viewerId() { return me.memberId || who; }
 
   /* ══════════ row mappers ══════════ */
-  function mMember(r) { return { id: r.id, name: r.name, full: r.full_name || r.name, role: r.role || "", color: r.color || "#c4667c", email: r.email || "", info: r.info || "", isOwner: !!r.is_owner, sort: r.sort || 0, notify: r.notify || {} }; }
+  function mMember(r) { return { id: r.id, name: r.name, full: r.full_name || r.name, role: r.role || "", color: r.color || "#c4667c", email: r.email || "", info: r.info || "", isOwner: !!r.is_owner, sort: r.sort || 0, notify: r.notify || {}, shared: r.shared || {} }; }
   function mClient(r) { return { id: r.id, name: r.name, status: r.status || "active", contact: r.contact || "", email: r.email || "", phone: r.phone || "", services: r.services || "", loomly: r.loomly || "", team: Array.isArray(r.team) ? r.team : [], notes: r.notes || "", sort: r.sort || 0 }; }
   function mTask(r) { return { id: r.id, clientId: r.client_id || "", title: r.title, assigneeId: r.assignee_id || "", due: r.due || "", time: r.time_of_day || "", status: r.status || "todo", kind: r.kind || "task", location: r.location || "", notes: r.notes || "", sort: r.sort || 0, archived: !!r.archived, completedAt: r.completed_at }; }
   function mLink(r) { return { id: r.id, name: r.name, emoji: r.emoji || "🔗", desc: r.descr || "", url: r.url || "", sort: r.sort || 0 }; }
   function mOff(r) { return { id: r.id, memberId: r.member_id, start: r.start_day, end: r.end_day, reason: r.reason || "", status: r.status || "requested" }; }
   function mCmt(r) { return { id: r.id, taskId: r.task_id, memberId: r.member_id, body: r.body, at: r.created_at }; }
   function mHours(r) { return { taskId: r.task_id, assigneeId: r.assignee_id || "", hours: Number(r.hours) || 0 }; }
+  function mTime(r) {
+    return { id: r.id, memberId: r.member_id, date: r.work_date, hours: Number(r.hours) || 0,
+      note: r.note || "", taskId: r.task_id || "", status: r.status || "draft" };
+  }
+  function timeRow(t) {
+    return { id: t.id, member_id: t.memberId, work_date: t.date, hours: t.hours,
+      note: t.note || "", task_id: t.taskId || null, status: t.status || "draft",
+      updated_at: new Date().toISOString() };
+  }
   function mStaff(r) {
     return { memberId: r.member_id, rate: Number(r.hourly_rate) || 0, payType: r.pay_type || "hourly",
       phone: r.phone || "", address: r.address || "", emName: r.emergency_name || "", emPhone: r.emergency_phone || "",
@@ -160,6 +172,7 @@
     return { member_id: x.memberId, hourly_rate: x.rate || 0, pay_type: x.payType || "hourly",
       phone: x.phone || "", address: x.address || "", emergency_name: x.emName || "", emergency_phone: x.emPhone || "",
       start_date: x.startDate || null, birthday: x.birthday || null, notes: x.notes || "",
+      title: x.title || "", weekly_hours: x.weeklyHours || 0, share: x.share || {},
       updated_at: new Date().toISOString() };
   }
   function hoursFor(id) { for (var i = 0; i < DB.hours.length; i++) if (DB.hours[i].taskId === id) return DB.hours[i].hours; return null; }
@@ -181,7 +194,7 @@
   }
   function memberRow(m) {
     return { id: m.id, name: m.name, full_name: m.full, role: m.role, color: m.color,
-      email: m.email, info: m.info, is_owner: !!m.isOwner, sort: m.sort || 0, notify: m.notify || {} };
+      email: m.email, info: m.info, is_owner: !!m.isOwner, sort: m.sort || 0, notify: m.notify || {}, shared: m.shared || {} };
   }
   function linkRow(l) { return { id: l.id, name: l.name, emoji: l.emoji, descr: l.desc, url: l.url, sort: l.sort || 0 }; }
 
@@ -198,7 +211,8 @@
       sb.from("activity").select("*").order("created_at", { ascending: false }).limit(60),
       sb.from("settings").select("data").eq("id", 1).maybeSingle(),
       sb.from("task_hours").select("*"),
-      sb.from("staff_private").select("*")
+      sb.from("staff_private").select("*"),
+      sb.from("time_entries").select("*").order("work_date", { ascending: false })
     ]).then(function (r) {
       if (r[0].error) { connected = false; seedFromFile(); return; }
       connected = true;
@@ -213,6 +227,7 @@
       // These two come back empty unless the viewer is allowed to see them.
       DB.hours = (r[8] && !r[8].error && r[8].data ? r[8].data : []).map(mHours);
       DB.staff = (r[9] && !r[9].error && r[9].data ? r[9].data : []).map(mStaff);
+      DB.time  = (r[10] && !r[10].error && r[10].data ? r[10].data : []).map(mTime);
     }).catch(function () { connected = false; seedFromFile(); });
   }
   function seedFromFile() {
@@ -472,7 +487,32 @@
     else if (view === "pay") v.innerHTML = viewPay();
     else if (view === "links") v.innerHTML = viewLinks();
     if (view === "board") wireDrag();
-    if (view === "pay") wireSeg("pay-seg", function (v) { payPeriod = v; render(); });
+    if (view === "pay") {
+      wireSeg("pay-tabs", function (v) { payTab = v; render(); });
+      wireSeg("pay-seg", function (v) { payPeriod = v; render(); });
+      $("view").querySelectorAll("[data-week]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var d = b.getAttribute("data-week");
+          weekOffset = d === "0" ? 0 : weekOffset + parseInt(d, 10);
+          render();
+        });
+      });
+      $("view").querySelectorAll("[data-log]").forEach(function (inp) {
+        inp.addEventListener("change", function () {
+          var parts = inp.getAttribute("data-log").split("|");
+          var v = parseFloat(inp.value);
+          if (isNaN(v) || v < 0) v = 0;
+          if (v > 24) { v = 24; inp.value = 24; }
+          logHours(parts[0], parts[1], v);
+        });
+        inp.addEventListener("keydown", function (ev) { if (ev.key === "Enter") inp.blur(); });
+      });
+      $("view").querySelectorAll("[data-approve-week]").forEach(function (b) {
+        b.addEventListener("click", function () { setWeekStatus(b.getAttribute("data-approve-week"), "approved"); });
+      });
+      var sub = $("view").querySelector("[data-submit-week]");
+      if (sub) sub.addEventListener("click", function () { setWeekStatus(viewerId(), "submitted"); });
+    }
   }
 
   function viewToday() {
@@ -637,55 +677,94 @@
       "<span>" + open.length + " open" + (late ? ' · <b style="color:var(--late)">' + late + " late</b>" : "") + "</span></div></div>";
   }
 
+  /* Fields the owner may choose to share with the rest of the team.
+     Anything not listed here is never shared: pay, address, emergency
+     contact and private notes stay owner-only, by design. */
+  var SHAREABLE = [
+    { k: "title",     label: "Job title" },
+    { k: "bio",       label: "About / bio" },
+    { k: "email",     label: "Email" },
+    { k: "phone",     label: "Phone" },
+    { k: "startDate", label: "Start date" },
+    { k: "birthday",  label: "Birthday" }
+  ];
+  function sharedVal(m, key) {
+    var sh = m.shared || {};
+    return sh[key] == null || sh[key] === "" ? null : sh[key];
+  }
+  // What the current viewer is allowed to see about someone.
+  function visibleInfo(m) {
+    var self = m.id === viewerId();
+    var priv = staffFor(m.id);
+    var out = [];
+    function add(label, val) { if (val) out.push({ label: label, val: val }); }
+    if (isOwner() || self) {
+      add("Title", (priv && priv.title) || "");
+      add("Email", m.email);
+      add("Phone", priv && priv.phone);
+      add("Started", priv && priv.startDate ? fDate(priv.startDate) : "");
+      add("Birthday", priv && priv.birthday ? fDate(priv.birthday) : "");
+    } else {
+      add("Title", sharedVal(m, "title"));
+      add("Email", sharedVal(m, "email"));
+      add("Phone", sharedVal(m, "phone"));
+      add("Started", sharedVal(m, "startDate") ? fDate(sharedVal(m, "startDate")) : null);
+      add("Birthday", sharedVal(m, "birthday") ? fDate(sharedVal(m, "birthday")) : null);
+    }
+    return out;
+  }
+  function visibleBio(m) {
+    var self = m.id === viewerId();
+    if (isOwner() || self) return m.info || "";
+    return sharedVal(m, "bio") || "";
+  }
+
   function viewTeam() {
     var td = today();
     var upcoming = DB.timeoff.filter(function (e) { return e.end >= td; })
       .sort(function (a, b) { return String(a.start).localeCompare(String(b.start)); });
-    var h = '<div class="page-head"><h2>The team</h2><div class="page-sub">Who\'s carrying what</div></div>';
-    h += progCard("Team progress", live(), "team", null);
+
+    var h = '<div class="page-head"><h2>The team</h2><div class="page-sub">' +
+      DB.members.length + " people" + (isOwner() ? " · tap anyone to open their profile" : "") + "</div></div>";
+    if (isOwner()) h += '<div class="section-actions" style="margin-bottom:16px">' +
+      '<button class="btn btn-dark btn-sm" data-newmember>' + ICON.plus + " Add employee</button></div>";
+
+    h += '<div class="people">' + DB.members.map(function (m) {
+      var priv = staffFor(m.id);
+      var self = m.id === viewerId();
+      var title = (isOwner() || self) ? (priv && priv.title) || m.role : (sharedVal(m, "title") || m.role);
+      var open = live().filter(function (t) { return t.assigneeId === m.id && t.status !== "done"; }).length;
+      var help = live().filter(function (t) { return t.assigneeId === m.id && t.status === "needhelp"; }).length;
+      var off = upcoming.filter(function (e) { return e.memberId === m.id && e.status === "approved" && e.start <= td && e.end >= td; }).length;
+      return '<div class="person click" data-person="' + esc(m.id) + '">' +
+        '<div class="person-top">' + avatar(m, "lg") +
+        '<div class="person-id"><h3>' + esc(m.full) + (self ? ' <span class="pill active">you</span>' : "") + "</h3>" +
+        '<div class="person-role">' + esc(title || "—") + "</div></div></div>" +
+        (m.email ? '<div class="person-line">✉ ' + esc(m.email) + "</div>" : "") +
+        '<div class="person-tags">' +
+          (off ? '<span class="pill approved">🌴 off today</span>' : "") +
+          (help ? '<span class="pill needhelp">' + help + " need help</span>" : "") +
+          '<span class="pill todo">' + open + " open</span>" +
+        "</div></div>";
+    }).join("") + "</div>";
 
     h += '<div class="section"><h3>Time off</h3><div class="section-actions">' +
       (isOwner() ? '<button class="btn btn-dark btn-sm" data-addoff>' + ICON.plus + " Add</button>"
                  : '<button class="btn btn-dark btn-sm" data-reqoff>🌴 Request time off</button>') + "</div></div>";
     h += upcoming.length ? upcoming.map(offHTML).join("") : '<div class="empty">No time off coming up.</div>';
 
-    h += '<div class="section"><h3>Everyone</h3>' + (isOwner() ? '<div class="section-actions"><button class="btn btn-dark btn-sm" data-newmember>' + ICON.plus + " Employee</button></div>" : "") + "</div>";
-    DB.members.forEach(function (m) {
-      var all = live().filter(function (t) { return t.assigneeId === m.id; });
-      var open = sortT(all.filter(function (t) { return t.status !== "done"; }));
-      var help = open.filter(function (t) { return t.status === "needhelp"; }).length;
-      var lateN = open.filter(isOverdue).length;
-      h += '<div class="card"><div class="person-head">' + avatar(m, "lg") +
-        '<div class="who-meta"><h3>' + esc(m.full) + (m.id === viewerId() ? ' <span class="pill active">you</span>' : "") + "</h3>" +
-        '<div class="card-sub">' + esc(m.role || "—") + "</div></div>" +
-        '<div style="display:flex;align-items:center;gap:5px;flex-shrink:0">' +
-        (help ? '<span class="pill needhelp">' + help + " need help</span>" : "") +
-        (lateN ? '<span class="pill overdue">' + lateN + " late</span>" : "") +
-        '<span class="pill todo">' + open.length + " open</span>" +
-        (isOwner() ? '<button class="mini-btn" data-editmember="' + esc(m.id) + '">' + ICON.edit + "</button>" : "") +
-        (isOwner() ? '<button class="mini-btn" data-assignto="' + esc(m.id) + '" title="Assign a task">' + ICON.plus + "</button>" : "") +
-        (isOwner() ? '<button class="mini-btn" data-hr="' + esc(m.id) + '" title="HR file">🔒</button>' : "") +
-        "</div></div>";
-      if (m.email) h += '<div class="row" style="margin-top:8px"><a href="mailto:' + esc(m.email) + '">' + esc(m.email) + "</a></div>";
-      if (m.info) h += '<div class="note">' + esc(m.info) + "</div>";
-      h += '<div style="margin-top:11px">' + progCard(m.name, all, m.id, null) + "</div>";
-      h += open.length ? open.map(function (t) { return taskHTML(t, { hideWho: true, nested: true }); }).join("")
-                       : '<div class="empty" style="padding:14px">All clear 🌿</div>';
-      h += "</div>";
-    });
-
     if (DB.activity.length) {
       h += '<div class="section"><h3>Recent activity</h3></div><div class="card">';
-      h += DB.activity.slice(0, 12).map(function (a) {
+      h += DB.activity.slice(0, 10).map(function (a) {
         var am = member(a.actorId);
         return '<div class="feed-item">' + avatar(am, "sm") +
-          '<div style="flex:1;min-width:0"><div>' + esc(am ? am.name : "Someone") + " " + esc(a.verb) + ' <b>' + esc(a.subject) + "</b></div>" +
+          '<div style="flex:1;min-width:0"><div>' + esc(am ? am.name : "Someone") + " " + esc(a.verb) + " <b>" + esc(a.subject) + "</b></div>" +
           '<div class="feed-when">' + ago(a.at) + "</div></div></div>";
-      }).join("");
-      h += "</div>";
+      }).join("") + "</div>";
     }
     return h;
   }
+
   function offHTML(e) {
     var m = member(e.memberId);
     return '<div class="off-row" data-off="' + esc(e.id) + '">🌴' + avatar(m, "sm") +
@@ -753,6 +832,114 @@
         earned: rate == null ? null : doneH * rate, projected: rate == null ? null : planned * rate };
     });
   }
+  var payTab = "summary";
+  function weekStart(offset) {
+    var t = new Date(); var d = t.getDay();
+    var mondayBack = (d + 6) % 7;
+    return addDays(-mondayBack + (offset || 0) * 7);
+  }
+  var weekOffset = 0;
+  function weekDays() {
+    var start = weekStart(weekOffset), out = [];
+    var sd = pDate(start);
+    for (var i = 0; i < 7; i++) {
+      var d = new Date(sd.getFullYear(), sd.getMonth(), sd.getDate() + i);
+      out.push(d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"));
+    }
+    return out;
+  }
+  function entryFor(mid, day) {
+    for (var i = 0; i < DB.time.length; i++) if (DB.time[i].memberId === mid && DB.time[i].date === day) return DB.time[i];
+    return null;
+  }
+  function logHours(mid, day, hours, status) {
+    var ex = entryFor(mid, day);
+    if (ex) {
+      if (hours === 0) { removeRow("time_entries", ex.id, "time"); return; }
+      ex.hours = hours; if (status) ex.status = status;
+      scheduleRender();
+      if (cloudReady) sb.from("time_entries").update({ hours: hours, status: ex.status, updated_at: new Date().toISOString() })
+        .eq("id", ex.id).select("id").then(function (r) { wrote(r, "Couldn't save those hours"); });
+      return;
+    }
+    if (!hours) return;
+    var row = { member_id: mid, work_date: day, hours: hours, status: status || "draft" };
+    if (!cloudReady) { DB.time.push({ id: uid(), memberId: mid, date: day, hours: hours, note: "", status: "draft" }); scheduleRender(); return; }
+    sb.from("time_entries").insert(row).select("*").then(function (r) {
+      if (r.error || !r.data || !r.data.length) return fail("Couldn't save those hours");
+      DB.time.push(mTime(r.data[0])); scheduleRender();
+    });
+  }
+  function setWeekStatus(mid, status) {
+    var days = weekDays();
+    var mine = DB.time.filter(function (e) { return e.memberId === mid && days.indexOf(e.date) >= 0; });
+    if (!mine.length) return toast("No hours logged that week", true);
+    mine.forEach(function (e) { e.status = status; });
+    scheduleRender();
+    if (!cloudReady) return;
+    Promise.all(mine.map(function (e) {
+      return sb.from("time_entries").update({ status: status }).eq("id", e.id).select("id");
+    })).then(function (res) {
+      var bad = res.filter(function (r) { return r.error || !r.data || !r.data.length; }).length;
+      if (bad) { fail("Couldn't update the timesheet"); loadAll().then(render); }
+      else toast(status === "approved" ? "Timesheet approved ✓" : status === "submitted" ? "Sent to Alise ✓" : "Reopened");
+    });
+  }
+
+  function viewTimesheet() {
+    var owner = isOwner();
+    var days = weekDays();
+    var people = owner ? DB.members : DB.members.filter(function (m) { return m.id === viewerId(); });
+    var label = fPlain(days[0]) + " – " + fPlain(days[6]);
+
+    var h = '<div class="ts-bar">' +
+      '<button class="btn btn-soft btn-sm" data-week="-1">‹ Prev</button>' +
+      '<b>' + label + (weekOffset === 0 ? " · this week" : "") + "</b>" +
+      '<button class="btn btn-soft btn-sm" data-week="1">Next ›</button>' +
+      (weekOffset !== 0 ? '<button class="btn btn-ghost btn-sm" data-week="0">Today</button>' : "") +
+      "</div>";
+
+    h += '<div class="tswrap"><div class="ts">';
+    h += '<div class="ts-row ts-head"><span class="ts-name">Person</span>' +
+      days.map(function (d) {
+        var dd = pDate(d);
+        return '<span class="' + (d === today() ? "is-today" : "") + '">' +
+          dd.toLocaleDateString("en-US", { weekday: "short" }) + "<i>" + dd.getDate() + "</i></span>";
+      }).join("") + "<span>Total</span></div>";
+
+    people.forEach(function (m) {
+      var rowTotal = 0, statuses = {};
+      var cells = days.map(function (d) {
+        var e = entryFor(m.id, d);
+        var v = e ? e.hours : 0;
+        rowTotal += v;
+        if (e) statuses[e.status] = true;
+        var locked = e && e.status === "approved" && !owner;
+        return '<span class="ts-cell' + (v ? " has" : "") + (d === today() ? " is-today" : "") + '">' +
+          '<input type="text" inputmode="decimal" value="' + (v || "") + '" placeholder="–" ' +
+          'data-log="' + esc(m.id) + "|" + d + '"' + (locked ? " disabled" : "") + "></span>";
+      }).join("");
+      var state = statuses.approved ? "approved" : statuses.submitted ? "submitted" : rowTotal ? "draft" : "";
+      h += '<div class="ts-row"><span class="ts-name">' + avatar(m, "sm") +
+        '<span class="ts-who"><b>' + esc(m.name) + "</b>" +
+        (state ? '<em class="ts-state s-' + state + '">' + state + "</em>" : "") + "</span>" +
+        "</span>" + cells + '<span class="ts-total">' + (Math.round(rowTotal * 10) / 10 || "0") + "</span></div>";
+    });
+    h += "</div></div>";
+
+    if (owner) {
+      h += '<div class="section"><h3>Approve</h3></div><div class="approve-row">' +
+        DB.members.map(function (m) {
+          return '<button class="btn btn-soft btn-sm" data-approve-week="' + esc(m.id) + '">Approve ' + esc(m.name) + "'s week</button>";
+        }).join("") + "</div>";
+      h += '<div class="hint">Type hours straight into the grid — it saves as you go. Approving locks that week for them.</div>';
+    } else {
+      h += '<div class="approve-row"><button class="btn btn-primary btn-sm" data-submit-week>Send this week to Alise</button></div>' +
+        '<div class="hint">Log what you actually worked. Once Alise approves a week it locks.</div>';
+    }
+    return h;
+  }
+
   function viewPay() {
     var owner = isOwner();
     var rows = payRows().filter(function (r) { return owner || r.m.id === viewerId(); });
@@ -760,14 +947,18 @@
       '<div class="page-sub">' + (owner ? "Hours and labour cost. Only you can see this page's numbers — the database refuses them to anyone else."
                                         : "Your hours and pay. Teammates can't see these.") + "</div></div>";
 
+    h += '<div class="seg" style="margin-bottom:16px;max-width:330px" id="pay-tabs">' +
+      '<button data-v="summary" class="' + (payTab === "summary" ? "on" : "") + '">Summary</button>' +
+      '<button data-v="sheet" class="' + (payTab === "sheet" ? "on" : "") + '">Timesheet</button></div>';
+    if (payTab === "sheet") return h + viewTimesheet();
+
     h += '<div class="seg" style="margin-bottom:18px;max-width:460px" id="pay-seg">' +
       [["week", "This week"], ["lastweek", "Last week"], ["month", "This month"], ["all", "All time"]].map(function (o) {
         return '<button data-v="' + o[0] + '" class="' + (payPeriod === o[0] ? "on" : "") + '">' + o[1] + "</button>";
       }).join("") + "</div>";
 
     if (!me.role) {
-      h += '<div class="banner warn">🔒 Sign in to see hours and pay. They are never sent to a browser that isn\'t signed in.</div>';
-      return h;
+      return h + '<div class="banner warn">🔒 Sign in to see hours and pay. They are never sent to a browser that isn\'t signed in.</div>';
     }
 
     var totalH = 0, totalDone = 0, totalCost = 0, totalProj = 0, anyRate = false;
@@ -1097,6 +1288,140 @@
       closeModal(); upsert("clients", clientRow(real), real, "clients");
       logAct(real.status === "archived" ? "archived client" : "reactivated client", real.name);
       toast(real.status === "archived" ? real.name + " → past clients 📁" : real.name + " is active again 🌱");
+    });
+  }
+
+  /* ── Person profile. Owner sees and edits everything; a teammate sees
+     only what the owner ticked "share with team"; you always see yourself. ── */
+  function personProfile(id) {
+    var m = member(id); if (!m) return;
+    var self = id === viewerId();
+    var priv = staffFor(id);
+    var info = visibleInfo(m), bio = visibleBio(m);
+    var open = sortT(live().filter(function (t) { return t.assigneeId === id && t.status !== "done"; }));
+
+    var h = "<div class='prof-head'>" + avatar(m, "lg") +
+      "<div><h3>" + esc(m.full) + "</h3><div class='modal-sub' style='margin:0'>" +
+      esc((isOwner() || self ? (priv && priv.title) || m.role : sharedVal(m, "title") || m.role) || "—") + "</div></div></div>";
+
+    if (bio) h += "<div class='note'>" + esc(bio) + "</div>";
+    if (info.length) {
+      h += "<label>Details</label><div class='deets'>" + info.map(function (d) {
+        return "<div class='deet'><span>" + esc(d.label) + "</span><b>" + esc(d.val) + "</b></div>";
+      }).join("") + "</div>";
+    } else {
+      h += "<div class='hint'>No contact details shared.</div>";
+    }
+
+    if (isOwner() || self) {
+      var r = payRows().filter(function (q) { return q.m.id === id; })[0];
+      var logged = DB.time.filter(function (e) { return e.memberId === id; })
+        .reduce(function (a, e) { return a + e.hours; }, 0);
+      h += "<label>🔒 " + (self && !isOwner() ? "Your pay" : "Pay & hours") + "</label>" +
+        "<div class='deets'>" +
+        "<div class='deet'><span>Rate</span><b>" + (priv && priv.rate ? money(priv.rate) + "/hr" : "not set") + "</b></div>" +
+        "<div class='deet'><span>Hours logged</span><b>" + (Math.round(logged * 10) / 10) + "</b></div>" +
+        (r ? "<div class='deet'><span>Scheduled (period)</span><b>" + (Math.round(r.planned * 10) / 10) + "</b></div>" : "") +
+        (r && r.projected != null ? "<div class='deet'><span>Projected</span><b>" + money(r.projected) + "</b></div>" : "") +
+        "</div>";
+    }
+
+    h += "<label>Open work (" + open.length + ")</label>";
+    h += open.length ? open.slice(0, 6).map(function (t) { return taskHTML(t, { hideWho: true, flat: true }); }).join("")
+                     : "<div class='hint'>Nothing open.</div>";
+
+    h += "<div class='modal-actions'>" +
+      (isOwner() ? "<button class='btn btn-soft' id='p-assign'>Assign task</button>" +
+                   "<button class='btn btn-soft' id='p-edit'>Edit profile</button>" : "") +
+      "<button class='btn btn-primary' data-close>Close</button></div>";
+    if (isOwner()) h += "<div class='danger-zone'><button class='btn btn-ghost' id='p-hr'>🔒 Open HR file</button></div>";
+
+    openModal(h);
+    var a = $("p-assign"); if (a) a.addEventListener("click", function () { taskForm(null, { assigneeId: id }); });
+    var e = $("p-edit");   if (e) e.addEventListener("click", function () { profileEdit(id); });
+    var hr = $("p-hr");    if (hr) hr.addEventListener("click", function () { hrFile(id); });
+  }
+
+  /* ── Owner-only profile editor with per-field sharing ── */
+  function profileEdit(id) {
+    if (!isOwner()) return;
+    var m = JSON.parse(JSON.stringify(member(id)));
+    var priv = staffFor(id);
+    var x = priv ? JSON.parse(JSON.stringify(priv))
+                 : { memberId: id, rate: 0, payType: "hourly", phone: "", address: "", emName: "", emPhone: "",
+                     startDate: "", birthday: "", notes: "", title: "", weeklyHours: 0, share: {} };
+    var share = x.share || {};
+
+    function fieldRow(k, label, inputHtml) {
+      var can = SHAREABLE.filter(function (f) { return f.k === k; }).length > 0;
+      return "<label>" + esc(label) +
+        (can ? "<button class='sharebox" + (share[k] ? " on" : "") + "' data-share='" + k + "' type='button'>" +
+               "<span class='tick'>✓</span> share with team</button>" : "") +
+        "</label>" + inputHtml;
+    }
+
+    openModal("<h3>Edit " + esc(m.name) + "'s profile</h3>" +
+      "<div class='modal-sub'>Tick <b>share with team</b> on anything the whole studio may see. Everything else stays between you and them.</div>" +
+      fieldRow("name", "Display name", "<input type='text' id='pe-name' value='" + esc(m.name) + "'>") +
+      fieldRow("full", "Full name", "<input type='text' id='pe-full' value='" + esc(m.full) + "'>") +
+      fieldRow("title", "Job title", "<input type='text' id='pe-title' value='" + esc(x.title || m.role) + "'>") +
+      fieldRow("bio", "About them", "<textarea id='pe-bio' placeholder='e.g. Leads Kristie Bridgers content'>" + esc(m.info) + "</textarea>") +
+      fieldRow("email", "Email", "<input type='text' id='pe-email' value='" + esc(m.email) + "'>") +
+      fieldRow("phone", "Phone", "<input type='text' id='pe-phone' value='" + esc(x.phone) + "'>") +
+      fieldRow("startDate", "Start date", "<input type='date' id='pe-start' value='" + esc(x.startDate || "") + "'>") +
+      fieldRow("birthday", "Birthday", "<input type='date' id='pe-bday' value='" + esc(x.birthday || "") + "'>") +
+      "<div class='lockbar'>🔒 Below is never shared with the team</div>" +
+      "<label>Hourly rate</label><input type='text' id='pe-rate' inputmode='decimal' value='" + esc(x.rate || "") + "'>" +
+      "<label>Usual hours a week</label><input type='text' id='pe-weekly' inputmode='decimal' value='" + esc(x.weeklyHours || "") + "'>" +
+      "<label>Home address</label><input type='text' id='pe-address' value='" + esc(x.address) + "'>" +
+      "<label>Emergency contact</label><div class='row2'>" +
+      "<input type='text' id='pe-emname' value='" + esc(x.emName) + "' placeholder='Name'>" +
+      "<input type='text' id='pe-emphone' value='" + esc(x.emPhone) + "' placeholder='Phone'></div>" +
+      "<label>Private notes</label><textarea id='pe-notes'>" + esc(x.notes) + "</textarea>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='pe-save'>Save profile</button></div>");
+
+    $("modal").querySelectorAll("[data-share]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var k = b.getAttribute("data-share");
+        share[k] = !share[k];
+        b.classList.toggle("on", !!share[k]);
+      });
+    });
+
+    $("pe-save").addEventListener("click", function () {
+      m.name = $("pe-name").value.trim() || m.name;
+      m.full = $("pe-full").value.trim() || m.name;
+      m.info = $("pe-bio").value.trim();
+      m.email = $("pe-email").value.trim();
+      x.title = $("pe-title").value.trim();
+      x.phone = $("pe-phone").value.trim();
+      x.startDate = $("pe-start").value || "";
+      x.birthday = $("pe-bday").value || "";
+      x.rate = parseFloat($("pe-rate").value) || 0;
+      x.weeklyHours = parseFloat($("pe-weekly").value) || 0;
+      x.address = $("pe-address").value.trim();
+      x.emName = $("pe-emname").value.trim();
+      x.emPhone = $("pe-emphone").value.trim();
+      x.notes = $("pe-notes").value.trim();
+      x.share = share;
+
+      // Only ticked values are copied into the publicly-readable row.
+      var vals = { title: x.title, bio: m.info, email: m.email, phone: x.phone, startDate: x.startDate, birthday: x.birthday };
+      var pub = {};
+      SHAREABLE.forEach(function (f) { if (share[f.k] && vals[f.k]) pub[f.k] = vals[f.k]; });
+      m.shared = pub;
+      if (!share.email) m.email = m.email;   // email stays on members for the owner's own use
+
+      var found = false;
+      for (var i = 0; i < DB.staff.length; i++) if (DB.staff[i].memberId === id) { DB.staff[i] = x; found = true; }
+      if (!found) DB.staff.push(x);
+
+      closeModal();
+      upsert("members", memberRow(m), m, "members");
+      if (cloudReady) sb.from("staff_private").upsert(staffRow(x)).select("member_id")
+        .then(function (res) { if (wrote(res)) toast("Profile saved 🔒"); });
+      else toast("Profile saved");
     });
   }
 
@@ -1512,6 +1837,7 @@
     if ((hit = t.closest("[data-approve]"))) return decideOff(hit.getAttribute("data-approve"), "approved");
     if ((hit = t.closest("[data-deny]"))) return decideOff(hit.getAttribute("data-deny"), "denied");
     if ((hit = t.closest("[data-mine]"))) { mineOnly = hit.getAttribute("data-mine") === "1"; return render(); }
+    if ((hit = t.closest("[data-person]"))) return personProfile(hit.getAttribute("data-person"));
     if ((hit = t.closest("[data-hr]"))) return hrFile(hit.getAttribute("data-hr"));
     if ((hit = t.closest("[data-assignto]"))) return taskForm(null, { assigneeId: hit.getAttribute("data-assignto") });
     if (t.closest("[data-newclient]")) return clientForm(null);
@@ -1639,6 +1965,39 @@
   $("gate-input").addEventListener("keydown", function (e) { if (e.key === "Enter") tryGate(); });
 
   /* ══════════ boot ══════════ */
+  var QA = location.search.indexOf("qa=") >= 0;
+  function qaSetup() {
+    if (!QA) return;
+    var role = /qa=owner/.test(location.search) ? "owner" : "employee";
+    var mid = (location.search.match(/who=([a-z0-9]+)/) || [])[1] || (role === "owner" ? "alise" : "hannah");
+    me = { userId: "qa", memberId: mid, role: role };
+    who = mid;
+    DB.staff = DB.members.map(function (m, i) {
+      return { memberId: m.id, rate: [0,23,20,18][i%4], payType: "hourly", phone: "662-555-010"+i,
+        address: "Oxford, MS", emName: "Kin of "+m.name, emPhone: "662-555-9999",
+        startDate: "2025-03-01", birthday: "1998-06-02", notes: "QA", title: ["Owner","Content lead","Scheduler","Outreach"][i%4],
+        weeklyHours: 20, share: { title: true, bio: true, email: i % 2 === 0 } };
+    });
+    DB.members.forEach(function (m, i) {
+      m.shared = { title: ["Owner","Content lead","Scheduler","Outreach"][i%4], bio: m.info };
+      if (i % 2 === 0) m.shared.email = m.email;
+    });
+    DB.hours = DB.tasks.map(function (t,i) { return { taskId: t.id, assigneeId: t.assigneeId, hours: [1,2.5,4,3][i%4] }; });
+    var base = new Date(); var back = (base.getDay()+6)%7;
+    function d(o){ var x=new Date(); x.setDate(x.getDate()-back+o); return x.getFullYear()+"-"+String(x.getMonth()+1).padStart(2,"0")+"-"+String(x.getDate()).padStart(2,"0"); }
+    DB.time = [
+      { id:"e1", memberId:"hannah", date:d(0), hours:4, note:"", status:"draft" },
+      { id:"e2", memberId:"hannah", date:d(1), hours:6.5, note:"", status:"draft" },
+      { id:"e3", memberId:"brailey", date:d(1), hours:3, note:"", status:"submitted" },
+      { id:"e4", memberId:"maddie", date:d(2), hours:5, note:"", status:"approved" }
+    ];
+    if (role === "employee") {
+      DB.staff = DB.staff.filter(function (x) { return x.memberId === mid; });
+      DB.hours = DB.hours.filter(function (x) { return x.assigneeId === mid; });
+      DB.time  = DB.time.filter(function (x) { return x.memberId === mid; });
+    }
+  }
+
   function boot() {
     if (gateOK()) hideGate(); else showGate();
     Promise.resolve()
@@ -1648,6 +2007,7 @@
         loaded = true;
         if (!DB.members.length) seedFromFile();
         if (me.memberId) who = me.memberId;
+        qaSetup();
         if (!view) view = isOwner() ? "today" : "mywork";
         paintConnection();
         render();
