@@ -1,1268 +1,1322 @@
-/* Claude & Co. Studio HQ — app logic (v3, cloud-synced).
-   Data lives in Supabase when assets/config.js has real values:
-   - app_state table: one JSON row, readable by all, writable only by
-     Alise's signed-in owner account (enforced server-side by RLS).
-   - timeoff table: readable by all; anyone can INSERT a 'requested' row
-     (that's how employees submit); only the owner can approve/deny/delete.
-   Everyone's screen refreshes on tab focus and every 30 seconds.
-   Without config values the app falls back to the old local-only mode
-   (localStorage + Publish-to-team), so nothing breaks mid-upgrade.
-   Pay/rates are intentionally absent from the entire app. */
+/* ═══════════════════════════════════════════════════════════
+   Claude & Co. Studio HQ — v4
+
+   Every entity is its own database table, so a change writes
+   one row instead of re-uploading the whole studio, and every
+   screen updates through a live subscription rather than a
+   30-second poll. Status toggles patch their own DOM node —
+   nothing else re-renders — which is what keeps taps instant.
+
+   Permissions are enforced server-side (Postgres RLS), not by
+   hiding buttons: anyone with the studio password can read and
+   submit a time-off request; only Alise's signed-in account can
+   change anything. Pay/rates exist nowhere in this app.
+   ═══════════════════════════════════════════════════════════ */
 
 (function () {
   "use strict";
 
-  var LS_STATE = "cco-hq-state-v1";
-  var LS_ACCESS = "cco-hq-access-v1";
-  var LS_WHO = "cco-hq-who-v1";
-  var SS_OWNER = "cco-hq-owner-v1";
+  var LS_ACCESS = "cco-access-v1";
+  var LS_WHO    = "cco-who-v1";
 
-  // ---------- cloud setup ----------
   var cfg = window.CCO_CONFIG || {};
-  var cloud = !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY &&
-    cfg.SUPABASE_URL.indexOf("PASTE_") < 0 && cfg.SUPABASE_ANON_KEY.indexOf("PASTE_") < 0 &&
-    window.supabase);
-  var sb = cloud ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY) : null;
-  var ownerFlag = false;          // cloud mode: true when signed in as Alise
-  var lastLocalEdit = 0;          // guards polling from clobbering in-flight edits
-  var pendingCloudState = null;   // cloud refresh arriving while a modal is open
+  var cloudReady = !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY &&
+    cfg.SUPABASE_URL.indexOf("PASTE_") < 0 && window.supabase);
+  var sb = cloudReady ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY, {
+    realtime: { params: { eventsPerSecond: 8 } }
+  }) : null;
 
-  var state = loadState();
+  /* ── local mirror of the database ── */
+  var DB = { members: [], clients: [], tasks: [], links: [], timeoff: [], comments: [], activity: [], settings: {} };
+  var me = { userId: null, memberId: null, role: null };
   var who = localStorage.getItem(LS_WHO) || "alise";
-  var activeTab = "today";
-  var mineOnly = { today: false, schedule: false };
+  var view = "today";
+  var mineOnly = false;
+  var connected = false;
+  var loaded = false;
+  var searchQ = "";
 
-  // ---------- state (local cache layer) ----------
-  function seedCopy() {
-    var s = JSON.parse(JSON.stringify(window.CCO_SEED));
-    if (!s.publishedAt) s.publishedAt = 0;
-    if (!s.timeoff) s.timeoff = [];
-    if (!s.links) s.links = [];
-    return s;
-  }
-  function loadState() {
-    var seed = seedCopy();
-    var raw = null;
-    try { raw = JSON.parse(localStorage.getItem(LS_STATE)); } catch (e) { raw = null; }
-    if (!raw) return seed;
-    if ((seed.version || 1) > (raw.version || 1)) return seed;
-    if (!cloud && (seed.publishedAt || 0) > (raw.publishedAt || 0)) return seed;
-    if (!raw.timeoff) raw.timeoff = [];
-    if (!raw.links) raw.links = seed.links;
-    return raw;
-  }
-  function cacheLocal() {
-    try { localStorage.setItem(LS_STATE, JSON.stringify(state)); } catch (e) {}
-  }
-  function save() {
-    lastLocalEdit = Date.now();
-    cacheLocal();
-    if (cloud && ownerFlag) pushStateSoon();
-  }
-
-  // ---------- cloud sync ----------
-  var pushTimer = null;
-  function stateForCloud() {
-    var out = JSON.parse(JSON.stringify(state));
-    delete out.timeoff; // lives in its own table
-    return out;
-  }
-  function pushStateSoon() {
-    clearTimeout(pushTimer);
-    pushTimer = setTimeout(pushStateNow, 700);
-  }
-  function pushStateNow() {
-    clearTimeout(pushTimer);
-    pushTimer = null;
-    return sb.from("app_state").upsert({ id: 1, data: stateForCloud(), updated_at: new Date().toISOString() })
-      .then(function (res) {
-        if (res.error) toast("⚠️ Couldn't save to the cloud — check your internet");
-      });
-  }
-  function rowToEntry(r) {
-    return { id: r.id, memberId: r.member_id, start: r.start_day, end: r.end_day, reason: r.reason || "", status: r.status };
-  }
-  function refreshCloud() {
-    if (!cloud) return Promise.resolve();
-    if (pushTimer || (ownerFlag && Date.now() - lastLocalEdit < 5000)) return Promise.resolve();
-    return Promise.all([
-      sb.from("app_state").select("data").eq("id", 1).maybeSingle(),
-      sb.from("timeoff").select("*").order("start_day")
-    ]).then(function (results) {
-      var stateRes = results[0], toRes = results[1];
-      if (stateRes.error || toRes.error) return;
-      var next = stateRes.data ? stateRes.data.data : stateForCloud();
-      next.timeoff = (toRes.data || []).map(rowToEntry);
-      if (JSON.stringify(next) === JSON.stringify(state)) return;
-      if (!$("modal-backdrop").classList.contains("hidden")) {
-        pendingCloudState = next; // don't yank a form out from under anyone
-        return;
-      }
-      state = next;
-      cacheLocal();
-      renderAll();
-    });
-  }
-  function seedCloudIfEmpty() {
-    // First owner sign-in: if the cloud is empty, upload this device's
-    // data as the starting point (including migrating old local time off).
-    return sb.from("app_state").select("id").eq("id", 1).maybeSingle().then(function (res) {
-      if (res.error || res.data) return;
-      var oldOff = (state.timeoff || []).map(function (e) {
-        return { member_id: e.memberId, start_day: e.start, end_day: e.end || e.start, reason: e.reason || "", status: e.status || "approved" };
-      });
-      return pushStateNow().then(function () {
-        if (oldOff.length) return sb.from("timeoff").insert(oldOff);
-      }).then(function () {
-        toast("Cloud is set up — everything now syncs live ✨");
-        refreshCloud();
-      });
-    });
-  }
-
-  // ---------- time off data access (works in both modes) ----------
-  function toSubmitRequest(e) {
-    if (cloud) {
-      return sb.from("timeoff").insert({ member_id: e.memberId, start_day: e.start, end_day: e.end, reason: e.reason, status: "requested" })
-        .then(function (res) {
-          if (res.error) { toast("⚠️ Couldn't send — check your internet"); return; }
-          refreshCloudForce();
-        });
-    }
-    state.timeoff.push(e); save(); renderAll();
-    return Promise.resolve();
-  }
-  function toOwnerUpsert(e, isNew) {
-    if (cloud) {
-      var row = { member_id: e.memberId, start_day: e.start, end_day: e.end, reason: e.reason, status: e.status };
-      var q = isNew ? sb.from("timeoff").insert(row) : sb.from("timeoff").update(row).eq("id", e.id);
-      return q.then(function (res) {
-        if (res.error) { toast("⚠️ Couldn't save — are you logged in as owner?"); return; }
-        refreshCloudForce();
-      });
-    }
-    if (isNew) state.timeoff.push(e);
-    save(); renderAll();
-    return Promise.resolve();
-  }
-  function toSetStatus(id, status, msg) {
-    if (cloud) {
-      return sb.from("timeoff").update({ status: status }).eq("id", id).then(function (res) {
-        if (res.error) { toast("⚠️ Couldn't update — are you logged in as owner?"); return; }
-        toast(msg);
-        refreshCloudForce();
-      });
-    }
-    var e = state.timeoff.find(function (x) { return x.id === id; });
-    if (e) { e.status = status; save(); toast(msg); renderAll(); }
-    return Promise.resolve();
-  }
-  function toDelete(id) {
-    if (cloud) {
-      return sb.from("timeoff").delete().eq("id", id).then(function (res) {
-        if (res.error) { toast("⚠️ Couldn't delete — are you logged in as owner?"); return; }
-        toast("Deleted");
-        refreshCloudForce();
-      });
-    }
-    state.timeoff = state.timeoff.filter(function (x) { return x.id !== id; });
-    save(); toast("Deleted"); renderAll();
-    return Promise.resolve();
-  }
-  function refreshCloudForce() {
-    lastLocalEdit = 0;
-    var t = pushTimer;
-    if (t) { pushStateNow().then(function () { refreshCloud(); }); return; }
-    refreshCloud();
-  }
-
-  // ---------- owner status ----------
-  function isOwner() {
-    return cloud ? ownerFlag : sessionStorage.getItem(SS_OWNER) === "1";
-  }
-
-  // ---------- helpers ----------
+  /* ══════════ tiny helpers ══════════ */
   function $(id) { return document.getElementById(id); }
+  function el(html) { var d = document.createElement("div"); d.innerHTML = html.trim(); return d.firstElementChild; }
   function esc(s) {
-    return String(s == null ? "" : s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
   function uid() { return "x" + Math.random().toString(36).slice(2, 9) + Date.now().toString(36); }
-  function todayStr() {
+  function today() {
     var t = new Date();
     return t.getFullYear() + "-" + String(t.getMonth() + 1).padStart(2, "0") + "-" + String(t.getDate()).padStart(2, "0");
   }
-  function parseDate(s) {
-    if (!s) return null;
-    var p = s.split("-");
-    return new Date(+p[0], +p[1] - 1, +p[2]);
+  function addDays(n) {
+    var t = new Date(); t.setDate(t.getDate() + n);
+    return t.getFullYear() + "-" + String(t.getMonth() + 1).padStart(2, "0") + "-" + String(t.getDate()).padStart(2, "0");
   }
-  function fmtDate(s) {
-    var dt = parseDate(s);
-    if (!dt) return "no date";
-    return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  function pDate(s) { if (!s) return null; var p = String(s).split("-"); return new Date(+p[0], +p[1] - 1, +p[2]); }
+  function fDate(s) {
+    var d = pDate(s); if (!d) return "";
+    if (s === today()) return "Today";
+    if (s === addDays(1)) return "Tomorrow";
+    if (s === addDays(-1)) return "Yesterday";
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   }
-  function fmtDow(s) {
-    var dt = parseDate(s);
-    return dt ? dt.toLocaleDateString("en-US", { weekday: "long" }) : "";
-  }
-  function fmtTime(t) {
+  function fDow(s) { var d = pDate(s); return d ? d.toLocaleDateString("en-US", { weekday: "long" }) : ""; }
+  function fTime(t) {
     if (!t) return "";
-    var p = t.split(":");
-    var h = +p[0], m = p[1];
-    var ap = h >= 12 ? "PM" : "AM";
-    h = h % 12; if (h === 0) h = 12;
-    return h + ":" + m + " " + ap;
+    var p = String(t).split(":"), h = +p[0], ap = h >= 12 ? "PM" : "AM";
+    h = h % 12 || 12; return h + ":" + p[1] + " " + ap;
   }
-  function isOverdue(task) {
-    return task.status !== "done" && task.due && task.due < todayStr();
+  function ago(iso) {
+    if (!iso) return "";
+    var s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    if (s < 604800) return Math.floor(s / 86400) + "d ago";
+    return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
   }
-  function member(id) {
-    for (var i = 0; i < state.team.length; i++) if (state.team[i].id === id) return state.team[i];
-    return null;
+  function member(id) { for (var i = 0; i < DB.members.length; i++) if (DB.members[i].id === id) return DB.members[i]; return null; }
+  function client(id) { for (var i = 0; i < DB.clients.length; i++) if (DB.clients[i].id === id) return DB.clients[i]; return null; }
+  function task(id) { for (var i = 0; i < DB.tasks.length; i++) if (DB.tasks[i].id === id) return DB.tasks[i]; return null; }
+  function live() { return DB.tasks.filter(function (t) { return !t.archived; }); }
+  function isOverdue(t) { return t.status !== "done" && t.due && t.due < today(); }
+  function isOwner() { return me.role === "owner"; }
+  function canCheck(t) {
+    if (isOwner()) return true;
+    return me.role === "employee" && t.assigneeId === me.memberId && !!DB.settings.employeesCanCheck;
   }
-  function client(id) {
-    for (var i = 0; i < state.clients.length; i++) if (state.clients[i].id === id) return state.clients[i];
-    return null;
+  function statusLabel(s) { return s === "archived" ? "past client" : s; }
+
+  function toast(msg, bad) {
+    var t = el('<div class="toast' + (bad ? " bad" : "") + '">' + esc(msg) + "</div>");
+    $("toast-host").appendChild(t);
+    setTimeout(function () { t.style.opacity = "0"; t.style.transition = "opacity .3s"; }, 2600);
+    setTimeout(function () { t.remove(); }, 3000);
   }
-  function statusLabel(s) {
-    return s === "archived" ? "past client" : s;
+  function greet() { var h = new Date().getHours(); return h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening"; }
+
+  var ICON = {
+    today:   '<svg viewBox="0 0 24 24"><path d="M12 3v2M5.6 5.6l1.4 1.4M3 12h2M19 12h2M17 7l1.4-1.4M12 19v2"/><circle cx="12" cy="12" r="4"/></svg>',
+    board:   '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="5" height="16" rx="1.5"/><rect x="9.5" y="4" width="5" height="11" rx="1.5"/><rect x="16" y="4" width="5" height="14" rx="1.5"/></svg>',
+    clients: '<svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5.5A1.5 1.5 0 019.5 4h5A1.5 1.5 0 0116 5.5V7"/></svg>',
+    team:    '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3 2.7-5 6-5s6 2 6 5"/><path d="M16 11.2A3 3 0 1016 5.4M18 19c0-2-.7-3.6-2-4.6"/></svg>',
+    sched:   '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>',
+    links:   '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></svg>',
+    check:   '<svg viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg>',
+    dots:    '<svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg>',
+    edit:    '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.1 2.1 0 00-3-3L5 17v3z"/></svg>',
+    chat:    '<svg viewBox="0 0 24 24"><path d="M20 15a2 2 0 01-2 2H8l-4 4V5a2 2 0 012-2h12a2 2 0 012 2z"/></svg>',
+    plus:    '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>'
+  };
+  var NAV = [
+    { id: "today",   label: "Today",    icon: "today" },
+    { id: "board",   label: "Board",    icon: "board" },
+    { id: "clients", label: "Clients",  icon: "clients" },
+    { id: "team",    label: "Team",     icon: "team" },
+    { id: "sched",   label: "Schedule", icon: "sched" },
+    { id: "links",   label: "Links",    icon: "links" }
+  ];
+  var TITLES = { today: "Today", board: "Board", clients: "Clients", team: "Team", sched: "Schedule", links: "Studio links" };
+
+  /* ══════════ row mappers ══════════ */
+  function mMember(r) { return { id: r.id, name: r.name, full: r.full_name || r.name, role: r.role || "", color: r.color || "#c4667c", email: r.email || "", info: r.info || "", isOwner: !!r.is_owner, sort: r.sort || 0 }; }
+  function mClient(r) { return { id: r.id, name: r.name, status: r.status || "active", contact: r.contact || "", email: r.email || "", phone: r.phone || "", services: r.services || "", loomly: r.loomly || "", team: Array.isArray(r.team) ? r.team : [], notes: r.notes || "", sort: r.sort || 0 }; }
+  function mTask(r) { return { id: r.id, clientId: r.client_id || "", title: r.title, assigneeId: r.assignee_id || "", due: r.due || "", time: r.time_of_day || "", status: r.status || "todo", kind: r.kind || "task", location: r.location || "", notes: r.notes || "", sort: r.sort || 0, archived: !!r.archived, completedAt: r.completed_at }; }
+  function mLink(r) { return { id: r.id, name: r.name, emoji: r.emoji || "🔗", desc: r.descr || "", url: r.url || "", sort: r.sort || 0 }; }
+  function mOff(r) { return { id: r.id, memberId: r.member_id, start: r.start_day, end: r.end_day, reason: r.reason || "", status: r.status || "requested" }; }
+  function mCmt(r) { return { id: r.id, taskId: r.task_id, memberId: r.member_id, body: r.body, at: r.created_at }; }
+  function mAct(r) { return { id: r.id, actorId: r.actor_id, verb: r.verb, subject: r.subject, at: r.created_at }; }
+
+  function taskRow(t) {
+    return { id: t.id, client_id: t.clientId || null, title: t.title, assignee_id: t.assigneeId || null,
+      due: t.due || null, time_of_day: t.time || "", status: t.status, kind: t.kind,
+      location: t.location || "", notes: t.notes || "", sort: t.sort || 0, archived: !!t.archived,
+      completed_at: t.status === "done" ? (t.completedAt || new Date().toISOString()) : null };
   }
-  function toast(msg) {
-    var el = document.createElement("div");
-    el.className = "toast";
-    el.textContent = msg;
-    document.body.appendChild(el);
-    setTimeout(function () { el.remove(); }, 3200);
+  function clientRow(c) {
+    return { id: c.id, name: c.name, status: c.status, contact: c.contact, email: c.email, phone: c.phone,
+      services: c.services, loomly: c.loomly, team: c.team, notes: c.notes, sort: c.sort || 0 };
   }
-  function greeting() {
-    var h = new Date().getHours();
-    if (h < 12) return "Good morning";
-    if (h < 17) return "Good afternoon";
-    return "Good evening";
+  function memberRow(m) {
+    return { id: m.id, name: m.name, full_name: m.full, role: m.role, color: m.color,
+      email: m.email, info: m.info, is_owner: !!m.isOwner, sort: m.sort || 0 };
+  }
+  function linkRow(l) { return { id: l.id, name: l.name, emoji: l.emoji, descr: l.desc, url: l.url, sort: l.sort || 0 }; }
+
+  /* ══════════ data loading ══════════ */
+  function loadAll() {
+    if (!cloudReady) { seedFromFile(); return Promise.resolve(); }
+    return Promise.all([
+      sb.from("members").select("*").order("sort"),
+      sb.from("clients").select("*").order("sort"),
+      sb.from("tasks").select("*").order("sort"),
+      sb.from("links").select("*").order("sort"),
+      sb.from("timeoff").select("*").order("start_day"),
+      sb.from("comments").select("*").order("created_at"),
+      sb.from("activity").select("*").order("created_at", { ascending: false }).limit(60),
+      sb.from("settings").select("data").eq("id", 1).maybeSingle()
+    ]).then(function (r) {
+      if (r[0].error) { connected = false; seedFromFile(); return; }
+      connected = true;
+      DB.members  = (r[0].data || []).map(mMember);
+      DB.clients  = (r[1].data || []).map(mClient);
+      DB.tasks    = (r[2].data || []).map(mTask);
+      DB.links    = (r[3].data || []).map(mLink);
+      DB.timeoff  = (r[4].data || []).map(mOff);
+      DB.comments = (r[5].data || []).map(mCmt);
+      DB.activity = (r[6].data || []).map(mAct);
+      DB.settings = (r[7].data && r[7].data.data) || {};
+    }).catch(function () { connected = false; seedFromFile(); });
+  }
+  function seedFromFile() {
+    var s = window.CCO_SEED; if (!s) return;
+    DB.members = (s.team || []).map(function (m) { return { id: m.id, name: m.name, full: m.full || m.name, role: m.role || "", color: m.color || "#c4667c", email: m.email || "", info: m.info || "", isOwner: !!m.isOwner }; });
+    DB.clients = (s.clients || []).map(function (c) { return { id: c.id, name: c.name, status: c.status, contact: c.contact || "", email: c.email || "", phone: c.phone || "", services: c.services || "", loomly: c.loomly || "", team: c.team || [], notes: c.notes || "" }; });
+    DB.tasks = (s.tasks || []).map(function (t) { return { id: t.id, clientId: t.clientId, title: t.title, assigneeId: t.assigneeId, due: t.due, time: t.time || "", status: t.status, kind: t.kind, location: t.location || "", notes: t.notes || "", archived: false }; });
+    DB.links = (s.links || []).map(function (l) { return { id: l.id || uid(), name: l.name, emoji: l.emoji, desc: l.desc, url: l.url }; });
+    DB.timeoff = (s.timeoff || []).slice();
+    DB.settings = s.settings || {};
   }
 
-  // ---------- access gate ----------
-  function checkGate() {
-    if (localStorage.getItem(LS_ACCESS) === "1") {
-      $("gate").classList.add("hidden");
-      $("app").classList.remove("hidden");
-      return;
-    }
-    $("gate").classList.remove("hidden");
-    $("app").classList.add("hidden");
+  /* ══════════ realtime ══════════ */
+  var TABLES = {
+    members: { arr: "members", map: mMember }, clients: { arr: "clients", map: mClient },
+    tasks: { arr: "tasks", map: mTask }, links: { arr: "links", map: mLink },
+    timeoff: { arr: "timeoff", map: mOff }, comments: { arr: "comments", map: mCmt },
+    activity: { arr: "activity", map: mAct }
+  };
+  function subscribe() {
+    if (!cloudReady) return;
+    var ch = sb.channel("studio-hq");
+    Object.keys(TABLES).forEach(function (tbl) {
+      ch.on("postgres_changes", { event: "*", schema: "public", table: tbl }, function (p) {
+        var spec = TABLES[tbl], arr = DB[spec.arr];
+        if (p.eventType === "DELETE") {
+          var oid = p.old && p.old.id;
+          for (var i = 0; i < arr.length; i++) if (arr[i].id === oid) { arr.splice(i, 1); break; }
+        } else {
+          var row = spec.map(p.new), found = false;
+          for (var j = 0; j < arr.length; j++) if (arr[j].id === row.id) { arr[j] = row; found = true; break; }
+          if (!found) arr.push(row);
+        }
+        scheduleRender();
+      });
+    });
+    ch.on("postgres_changes", { event: "*", schema: "public", table: "settings" }, function (p) {
+      if (p.new && p.new.data) { DB.settings = p.new.data; scheduleRender(); }
+    });
+    ch.subscribe(function (status) {
+      connected = status === "SUBSCRIBED";
+      paintConnection();
+    });
   }
-  $("gate-btn").addEventListener("click", tryGate);
-  $("gate-input").addEventListener("keydown", function (e) { if (e.key === "Enter") tryGate(); });
-  function tryGate() {
-    var v = $("gate-input").value.trim().toLowerCase();
-    if (v === String(state.settings.accessCode).toLowerCase()) {
-      localStorage.setItem(LS_ACCESS, "1");
-      $("gate-err").classList.add("hidden");
-      checkGate();
-      renderAll();
+  var renderPending = false;
+  function scheduleRender() {
+    if (renderPending) return;
+    renderPending = true;
+    requestAnimationFrame(function () { renderPending = false; render(); });
+  }
+
+  /* ══════════ writes ══════════ */
+  function fail(e) { toast(e || "Couldn't save — check your connection", true); }
+  // A row blocked by RLS comes back as success-with-nothing-changed, so an
+  // expired session would otherwise look like it saved. Ask for the row back
+  // and treat "no rows" as the failure it really is.
+  function wrote(res, msg) {
+    if (res.error || !res.data || !res.data.length) {
+      fail(msg || "Couldn't save — try signing in again");
+      loadAll().then(render);
+      return false;
+    }
+    return true;
+  }
+  function logAct(verb, subject) {
+    if (!cloudReady || !isOwner()) return;
+    sb.from("activity").insert({ actor_id: me.memberId || "alise", verb: verb, subject: subject }).then(function () {});
+  }
+  function upsert(table, row, mapped, arrName) {
+    // optimistic: local first, server second — the UI never waits on the network
+    var arr = DB[arrName], found = false;
+    for (var i = 0; i < arr.length; i++) if (arr[i].id === mapped.id) { arr[i] = mapped; found = true; break; }
+    if (!found) arr.push(mapped);
+    scheduleRender();
+    if (!cloudReady) return Promise.resolve();
+    return sb.from(table).upsert(row).select("id").then(function (r) { wrote(r); });
+  }
+  function removeRow(table, id, arrName) {
+    var arr = DB[arrName];
+    for (var i = 0; i < arr.length; i++) if (arr[i].id === id) { arr.splice(i, 1); break; }
+    scheduleRender();
+    if (!cloudReady) return Promise.resolve();
+    return sb.from(table).delete().eq("id", id).select("id").then(function (r) { wrote(r, "Couldn't delete — try signing in again"); });
+  }
+  function saveSettings() {
+    if (!cloudReady) return Promise.resolve();
+    return sb.from("settings").upsert({ id: 1, data: DB.settings, updated_at: new Date().toISOString() }).select("id")
+      .then(function (r) { wrote(r); });
+  }
+
+  /* ══════════ status toggle (targeted, no full re-render) ══════════ */
+  function cycle(s) { return s === "todo" ? "inprogress" : s === "inprogress" ? "done" : "todo"; }
+  function toggleStatus(id) {
+    var t = task(id); if (!t || !canCheck(t)) return;
+    t.status = cycle(t.status);
+    t.completedAt = t.status === "done" ? new Date().toISOString() : null;
+    patchTaskNodes(t);
+    patchProgress();
+    if (t.status === "done") logAct("completed", t.title);
+    if (!cloudReady) return;
+    sb.from("tasks").update({ status: t.status, completed_at: t.completedAt }).eq("id", t.id).select("id")
+      .then(function (r) { wrote(r, "Couldn't update — are you still signed in?"); });
+  }
+  function patchTaskNodes(t) {
+    document.querySelectorAll('[data-task="' + t.id + '"]').forEach(function (node) {
+      node.classList.toggle("is-done", t.status === "done");
+      var btn = node.querySelector(".check");
+      if (btn) {
+        btn.className = "check " + t.status;
+        btn.innerHTML = t.status === "done" ? ICON.check : t.status === "inprogress" ? "" : "";
+      }
+      var pill = node.querySelector(".pill.status-pill");
+      if (pill) { pill.className = "pill status-pill " + t.status; pill.textContent = t.status === "inprogress" ? "in progress" : t.status === "todo" ? "to do" : "done"; }
+    });
+    if (view === "board") scheduleRender();
+  }
+  function patchProgress() {
+    document.querySelectorAll("[data-prog]").forEach(function (node) {
+      var scope = node.getAttribute("data-prog");
+      var list = scope === "team" ? live() : live().filter(function (t) { return t.assigneeId === scope; });
+      var p = pct(list);
+      var fill = node.querySelector(".bar-fill"), lab = node.querySelector(".prog-pct"), sub = node.querySelector(".prog-sub");
+      if (fill) { fill.style.width = p.pct + "%"; fill.classList.toggle("full", p.full); }
+      if (lab) { lab.textContent = p.full ? "100% 🎉" : p.pct + "%"; lab.classList.toggle("full", p.full); }
+      if (sub) sub.textContent = p.done + " of " + p.total + " task" + (p.total === 1 ? "" : "s") + " done";
+    });
+  }
+  function pct(list) {
+    var total = list.length, done = list.filter(function (t) { return t.status === "done"; }).length;
+    return { total: total, done: done, pct: total ? Math.round(done / total * 100) : 0, full: total > 0 && done === total };
+  }
+
+  /* ══════════ shared bits ══════════ */
+  function avatar(m, cls) {
+    if (!m) return '<span class="avatar sm" style="background:#c9c2bf">?</span>';
+    return '<span class="avatar ' + (cls || "") + '" style="background:' + esc(m.color) + '" title="' + esc(m.full) + '">' + esc(m.name.slice(0, 2).toUpperCase()) + "</span>";
+  }
+  function progCard(label, list, scope, m) {
+    var p = pct(list);
+    return '<div class="prog-card" data-prog="' + esc(scope) + '">' +
+      '<div class="prog-top"><span class="prog-name">' + (m ? avatar(m, "sm") : "") + esc(label) + "</span>" +
+      '<span class="prog-pct' + (p.full ? " full" : "") + '">' + (p.full ? "100% 🎉" : p.pct + "%") + "</span></div>" +
+      '<div class="bar"><div class="bar-fill' + (p.full ? " full" : "") + '" style="width:' + p.pct + '%"></div></div>' +
+      '<div class="prog-sub">' + p.done + " of " + p.total + " task" + (p.total === 1 ? "" : "s") + " done</div></div>";
+  }
+  function taskHTML(t, opt) {
+    opt = opt || {};
+    var m = member(t.assigneeId), c = client(t.clientId), bits = [];
+    if (!opt.hideClient && c) bits.push("<b>" + esc(c.name) + "</b>");
+    if (t.due) bits.push((isOverdue(t) ? '<span class="pill overdue">late</span> ' : "") + fDate(t.due) + (t.time ? " · " + fTime(t.time) : ""));
+    if (t.kind === "shoot") bits.push('<span class="pill shoot">📷 shoot</span>');
+    if (t.location) bits.push("📍 " + esc(t.location));
+    if (m && !opt.hideWho) bits.push('<span class="who" style="color:' + esc(m.color) + '">' + esc(m.name) + "</span>");
+    bits.push('<span class="pill status-pill ' + t.status + '">' + (t.status === "inprogress" ? "in progress" : t.status === "todo" ? "to do" : "done") + "</span>");
+    var n = DB.comments.filter(function (x) { return x.taskId === t.id; }).length;
+    return '<div class="task' + (opt.nested ? " nested" : "") + (t.status === "done" ? " is-done" : "") + '" data-task="' + esc(t.id) + '">' +
+      '<button class="check ' + t.status + '" data-toggle="' + esc(t.id) + '"' + (canCheck(t) ? "" : " disabled") +
+        ' aria-label="Change status">' + (t.status === "done" ? ICON.check : "") + "</button>" +
+      '<div class="task-main"><div class="task-title">' + esc(t.title) + "</div>" +
+      '<div class="task-meta">' + bits.join(" ") + "</div>" +
+      (t.notes ? '<div class="task-note">' + esc(t.notes) + "</div>" : "") + "</div>" +
+      '<div class="task-tools">' +
+        '<button class="mini-btn" data-open="' + esc(t.id) + '" title="Comments">' + ICON.chat + (n ? '<span class="cnt">' + n + "</span>" : "") + "</button>" +
+        (isOwner() ? '<button class="mini-btn" data-edit="' + esc(t.id) + '" title="Edit">' + ICON.edit + "</button>" : "") +
+      "</div></div>";
+  }
+  function sortT(list) {
+    return list.slice().sort(function (a, b) {
+      return String(a.due || "9999").localeCompare(String(b.due || "9999")) ||
+             String(a.time || "").localeCompare(String(b.time || "")) || (a.sort || 0) - (b.sort || 0);
+    });
+  }
+  function quickAdd(placeholder, attrs) {
+    if (!isOwner()) return "";
+    return '<div class="quick-add">' + ICON.plus +
+      '<input type="text" placeholder="' + esc(placeholder) + '" data-quick="1" ' + (attrs || "") + ' enterkeyhint="done">' + "</div>";
+  }
+
+  /* ══════════ views ══════════ */
+  function render() {
+    if (!loaded) return;
+    $("skeleton").classList.add("hidden");
+    $("view").classList.remove("hidden");
+    $("topbar-title").textContent = TITLES[view];
+    $("fab").classList.toggle("hidden", !isOwner() || view === "links");
+    paintNav(); paintOwnerBar(); paintWho();
+    var v = $("view");
+    if (view === "today") v.innerHTML = viewToday();
+    else if (view === "board") v.innerHTML = viewBoard();
+    else if (view === "clients") v.innerHTML = viewClients();
+    else if (view === "team") v.innerHTML = viewTeam();
+    else if (view === "sched") v.innerHTML = viewSched();
+    else if (view === "links") v.innerHTML = viewLinks();
+    if (view === "board") wireDrag();
+  }
+
+  function viewToday() {
+    var m = member(who) || member(me.memberId), td = today();
+    var pool = mineOnly ? live().filter(function (t) { return t.assigneeId === who; }) : live();
+    var over = sortT(pool.filter(isOverdue));
+    var due = sortT(pool.filter(function (t) { return t.due === td && t.status !== "done"; }));
+    var prog = pool.filter(function (t) { return t.status === "inprogress"; });
+    var shoots = sortT(pool.filter(function (t) { return t.kind === "shoot" && t.status !== "done" && t.due >= td && t.due <= addDays(7); }));
+    var pending = DB.timeoff.filter(function (e) { return e.status === "requested"; });
+
+    var h = '<div class="page-head"><h2>' + greet() + ", " + esc(m ? m.name : "there") + " 🌸</h2>" +
+      '<div class="page-sub">' + new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }) + "</div></div>";
+
+    h += '<div class="seg" style="margin-bottom:18px;max-width:290px">' +
+      '<button data-mine="0" class="' + (mineOnly ? "" : "on") + '">Everyone</button>' +
+      '<button data-mine="1" class="' + (mineOnly ? "on" : "") + '">Just ' + esc(m ? m.name : "me") + "</button></div>";
+
+    h += '<div class="stats">' +
+      '<div class="stat ' + (over.length ? "late" : "good") + '" data-jump="over"><div class="n">' + over.length + '</div><div class="l">Overdue</div></div>' +
+      '<div class="stat warm" data-jump="due"><div class="n">' + due.length + '</div><div class="l">Due today</div></div>' +
+      '<div class="stat"><div class="n">' + prog.length + '</div><div class="l">In progress</div></div>' +
+      '<div class="stat"><div class="n">' + shoots.length + '</div><div class="l">Shoots this week</div></div></div>';
+
+    h += '<div class="section"><h3>Progress</h3>' +
+      (isOwner() ? '<div class="section-actions"><button class="btn btn-soft btn-sm" data-digest>Email today\'s plan</button></div>' : "") + "</div>";
+    h += progCard(m ? m.name : "You", live().filter(function (t) { return t.assigneeId === who; }), who, m);
+    h += progCard("The whole team", live(), "team", null);
+
+    if (isOwner() && pending.length) {
+      h += '<div class="section"><h3>Waiting on you</h3></div>';
+      h += pending.map(offHTML).join("");
+    }
+    if (over.length) {
+      h += '<div class="section" id="over"><h3>Overdue</h3></div>' + over.map(function (t) { return taskHTML(t); }).join("");
+    }
+
+    h += '<div class="section" id="due"><h3>Today, client by client</h3></div>';
+    var todays = sortT(pool.filter(function (t) { return t.due === td; }));
+    if (!todays.length) {
+      h += '<div class="empty"><span class="big">🌿</span>Nothing due today' + (mineOnly ? " for you" : "") + ". Enjoy it.</div>";
     } else {
-      $("gate-err").classList.remove("hidden");
+      var by = {};
+      todays.forEach(function (t) { (by[t.clientId] = by[t.clientId] || []).push(t); });
+      DB.clients.forEach(function (c) {
+        if (!by[c.id]) return;
+        h += '<div class="card"><div class="card-head"><div><h3 class="card-title">' + esc(c.name) + "</h3></div>" +
+          '<span class="avatars">' + c.team.map(function (id) { return avatar(member(id), "sm"); }).join("") + "</span></div>" +
+          '<div style="margin-top:10px">' + by[c.id].map(function (t) { return taskHTML(t, { hideClient: true, nested: true }); }).join("") + "</div></div>";
+      });
+      if (by[""]) h += by[""].map(function (t) { return taskHTML(t); }).join("");
     }
+    h += quickAdd("Add a task for today…", 'data-due="' + td + '"');
+
+    if (shoots.length) h += '<div class="section"><h3>Shoots this week</h3></div>' + shoots.map(function (t) { return taskHTML(t); }).join("");
+    return h;
   }
 
-  // ---------- header / tabs ----------
-  function renderWho() {
-    var sel = $("who");
-    sel.innerHTML = state.team.map(function (m) {
-      return '<option value="' + m.id + '"' + (m.id === who ? " selected" : "") + ">" + esc(m.name) + "</option>";
+  var COLS = [
+    { id: "todo", label: "To do", color: "#b9b1ad" },
+    { id: "inprogress", label: "In progress", color: "#d98f2b" },
+    { id: "done", label: "Done", color: "#4f7460" }
+  ];
+  function viewBoard() {
+    var pool = mineOnly ? live().filter(function (t) { return t.assigneeId === who; }) : live();
+    var m = member(who);
+    var h = '<div class="page-head"><h2>Board</h2><div class="page-sub">' +
+      (isOwner() ? "Drag a card between columns to change its status." : "Everything the studio is working on.") + "</div></div>";
+    h += '<div class="seg" style="margin-bottom:18px;max-width:290px">' +
+      '<button data-mine="0" class="' + (mineOnly ? "" : "on") + '">Everyone</button>' +
+      '<button data-mine="1" class="' + (mineOnly ? "on" : "") + '">Just ' + esc(m ? m.name : "me") + "</button></div>";
+    h += '<div class="board">';
+    COLS.forEach(function (col) {
+      var items = sortT(pool.filter(function (t) { return t.status === col.id; }));
+      h += '<div class="col" data-col="' + col.id + '"><div class="col-head">' +
+        '<span class="col-dot" style="background:' + col.color + '"></span><h4>' + col.label + "</h4>" +
+        '<span class="col-count">' + items.length + "</span></div>";
+      h += items.map(bcardHTML).join("");
+      if (!items.length) h += '<div class="empty" style="padding:16px 10px;margin:0">Nothing here</div>';
+      if (isOwner() && col.id === "todo") h += quickAdd("Add a task…", "");
+      h += "</div>";
+    });
+    h += "</div>";
+    return h;
+  }
+  function bcardHTML(t) {
+    var c = client(t.clientId), m = member(t.assigneeId);
+    var n = DB.comments.filter(function (x) { return x.taskId === t.id; }).length;
+    return '<div class="bcard" data-card="' + esc(t.id) + '" data-task="' + esc(t.id) + '">' +
+      (c ? '<div class="bcard-client">' + esc(c.name) + "</div>" : "") +
+      '<div class="bcard-title">' + esc(t.title) + "</div>" +
+      '<div class="bcard-meta">' + (m ? avatar(m, "sm") : "") +
+      (t.due ? "<span" + (isOverdue(t) ? ' style="color:var(--late);font-weight:700"' : "") + ">" + fDate(t.due) + "</span>" : "") +
+      (t.kind === "shoot" ? '<span class="pill shoot">📷</span>' : "") +
+      (n ? "<span>💬 " + n + "</span>" : "") + "</div></div>";
+  }
+
+  function viewClients() {
+    var act = DB.clients.filter(function (c) { return c.status !== "archived"; });
+    var past = DB.clients.filter(function (c) { return c.status === "archived"; });
+    var h = '<div class="page-head"><h2>Clients</h2><div class="page-sub">' + act.length + " on the books</div></div>";
+    if (isOwner()) h += '<div class="section-actions" style="margin-bottom:14px"><button class="btn btn-dark btn-sm" data-newclient>' + ICON.plus + " New client</button></div>";
+    h += '<div class="grid-2">' + act.map(clientCard).join("") + "</div>";
+    if (past.length) h += '<div class="section"><h3>Past clients</h3></div><div class="grid-2">' + past.map(clientCard).join("") + "</div>";
+    return h;
+  }
+  function clientCard(c) {
+    var open = live().filter(function (t) { return t.clientId === c.id && t.status !== "done"; });
+    var late = open.filter(isOverdue).length;
+    return '<div class="card click" data-client="' + esc(c.id) + '">' +
+      '<div class="card-head"><div style="min-width:0"><h3 class="card-title">' + esc(c.name) + "</h3>" +
+      '<div class="card-sub">' + esc(c.services || "—") + "</div></div>" +
+      '<span class="pill ' + c.status + '">' + statusLabel(c.status) + "</span></div>" +
+      '<div class="row" style="margin-top:10px;display:flex;align-items:center;gap:8px">' +
+      '<span class="avatars">' + c.team.map(function (id) { return avatar(member(id), "sm"); }).join("") + "</span>" +
+      "<span>" + open.length + " open" + (late ? ' · <b style="color:var(--late)">' + late + " late</b>" : "") + "</span></div></div>";
+  }
+
+  function viewTeam() {
+    var td = today();
+    var upcoming = DB.timeoff.filter(function (e) { return e.end >= td; })
+      .sort(function (a, b) { return String(a.start).localeCompare(String(b.start)); });
+    var h = '<div class="page-head"><h2>The team</h2><div class="page-sub">Who\'s carrying what</div></div>';
+    h += progCard("Team progress", live(), "team", null);
+
+    h += '<div class="section"><h3>Time off</h3><div class="section-actions">' +
+      (isOwner() ? '<button class="btn btn-dark btn-sm" data-addoff>' + ICON.plus + " Add</button>"
+                 : '<button class="btn btn-dark btn-sm" data-reqoff>🌴 Request time off</button>') + "</div></div>";
+    h += upcoming.length ? upcoming.map(offHTML).join("") : '<div class="empty">No time off coming up.</div>';
+
+    h += '<div class="section"><h3>Everyone</h3>' + (isOwner() ? '<div class="section-actions"><button class="btn btn-dark btn-sm" data-newmember>' + ICON.plus + " Employee</button></div>" : "") + "</div>";
+    DB.members.forEach(function (m) {
+      var all = live().filter(function (t) { return t.assigneeId === m.id; });
+      var open = sortT(all.filter(function (t) { return t.status !== "done"; }));
+      h += '<div class="card"><div class="card-head">' +
+        '<div style="display:flex;align-items:center;gap:11px;min-width:0">' + avatar(m, "lg") +
+        '<div style="min-width:0"><h3 class="card-title">' + esc(m.full) + "</h3>" +
+        '<div class="card-sub">' + esc(m.role || "—") + "</div></div></div>" +
+        '<div style="display:flex;align-items:center;gap:5px"><span class="pill todo">' + open.length + " open</span>" +
+        (isOwner() ? '<button class="mini-btn" data-editmember="' + esc(m.id) + '">' + ICON.edit + "</button>" : "") + "</div></div>";
+      if (m.email) h += '<div class="row" style="margin-top:8px"><a href="mailto:' + esc(m.email) + '">' + esc(m.email) + "</a></div>";
+      if (m.info) h += '<div class="note">' + esc(m.info) + "</div>";
+      h += '<div style="margin-top:11px">' + progCard(m.name, all, m.id, null) + "</div>";
+      h += open.length ? open.map(function (t) { return taskHTML(t, { hideWho: true, nested: true }); }).join("")
+                       : '<div class="empty" style="padding:14px">All clear 🌿</div>';
+      h += "</div>";
+    });
+
+    if (DB.activity.length) {
+      h += '<div class="section"><h3>Recent activity</h3></div><div class="card">';
+      h += DB.activity.slice(0, 12).map(function (a) {
+        var am = member(a.actorId);
+        return '<div class="feed-item">' + avatar(am, "sm") +
+          '<div style="flex:1;min-width:0"><div>' + esc(am ? am.name : "Someone") + " " + esc(a.verb) + ' <b>' + esc(a.subject) + "</b></div>" +
+          '<div class="feed-when">' + ago(a.at) + "</div></div></div>";
+      }).join("");
+      h += "</div>";
+    }
+    return h;
+  }
+  function offHTML(e) {
+    var m = member(e.memberId);
+    return '<div class="off-row" data-off="' + esc(e.id) + '">🌴' + avatar(m, "sm") +
+      '<span class="flex"><b>' + esc(m ? m.name : "?") + "</b> " + fDate(e.start) + (e.end !== e.start ? " – " + fDate(e.end) : "") +
+      (e.reason ? ' <span style="color:var(--muted)">· ' + esc(e.reason) + "</span>" : "") + "</span>" +
+      '<span class="pill ' + e.status + '">' + e.status + "</span>" +
+      (isOwner() ? (e.status === "requested"
+        ? '<button class="btn btn-dark btn-sm" data-approve="' + esc(e.id) + '">Approve</button>' +
+          '<button class="btn btn-soft btn-sm" data-deny="' + esc(e.id) + '">Deny</button>' : "") +
+        '<button class="mini-btn" data-editoff="' + esc(e.id) + '">' + ICON.edit + "</button>" : "") + "</div>";
+  }
+
+  function viewSched() {
+    var td = today();
+    var pool = mineOnly ? live().filter(function (t) { return t.assigneeId === who; }) : live();
+    var up = sortT(pool.filter(function (t) { return t.status !== "done" && t.due && t.due >= td; }));
+    var days = {};
+    up.forEach(function (t) { (days[t.due] = days[t.due] || { t: [], o: [] }).t.push(t); });
+    DB.timeoff.forEach(function (e) {
+      if (e.status !== "approved" || e.end < td) return;
+      if (mineOnly && e.memberId !== who) return;
+      var k = e.start >= td ? e.start : td;
+      (days[k] = days[k] || { t: [], o: [] }).o.push(e);
+    });
+    var keys = Object.keys(days).sort();
+    var h = '<div class="page-head"><h2>Schedule</h2><div class="page-sub">Shoots, deadlines and time off</div></div>';
+    var m = member(who);
+    h += '<div class="seg" style="margin-bottom:18px;max-width:290px">' +
+      '<button data-mine="0" class="' + (mineOnly ? "" : "on") + '">Everyone</button>' +
+      '<button data-mine="1" class="' + (mineOnly ? "on" : "") + '">Just ' + esc(m ? m.name : "me") + "</button></div>";
+    if (isOwner()) h += '<div class="section-actions" style="margin-bottom:14px"><button class="btn btn-dark btn-sm" data-newshoot>📷 Schedule a shoot</button></div>';
+    if (!keys.length) h += '<div class="empty"><span class="big">🗓</span>Nothing on the calendar yet.</div>';
+    keys.forEach(function (d) {
+      h += '<div class="day"><div class="day-head"><b>' + fDow(d) + "</b><span>" + fDate(d) + "</span>" +
+        (d === td ? '<span class="today-tag">today</span>' : "") + "</div>" +
+        days[d].o.map(offHTML).join("") + days[d].t.map(function (t) { return taskHTML(t); }).join("") + "</div>";
+    });
+    return h;
+  }
+
+  function viewLinks() {
+    var h = '<div class="page-head"><h2>Studio links</h2><div class="page-sub">Every tool, one tap away</div></div>';
+    if (isOwner()) h += '<div class="section-actions" style="margin-bottom:14px"><button class="btn btn-dark btn-sm" data-newlink>' + ICON.plus + " Add link</button></div>";
+    h += '<div class="links">' + DB.links.map(function (l) {
+      return '<a class="link" href="' + esc(l.url) + '" target="_blank" rel="noopener">' +
+        '<div class="emo">' + esc(l.emoji) + '</div><div class="nm">' + esc(l.name) + "</div>" +
+        '<div class="ds">' + esc(l.desc) + "</div>" +
+        (isOwner() ? '<button class="mini-btn edit" data-editlink="' + esc(l.id) + '">' + ICON.edit + "</button>" : "") + "</a>";
+    }).join("") + "</div>";
+    return h;
+  }
+
+  /* ══════════ chrome painters ══════════ */
+  function paintNav() {
+    var pending = DB.timeoff.filter(function (e) { return e.status === "requested"; }).length;
+    var over = live().filter(isOverdue).length;
+    $("nav-items").innerHTML = NAV.map(function (n) {
+      var badge = "";
+      if (n.id === "today" && over) badge = '<span class="nav-badge">' + over + "</span>";
+      if (n.id === "team" && pending && isOwner()) badge = '<span class="nav-badge">' + pending + "</span>";
+      return '<button class="nav-item' + (view === n.id ? " on" : "") + '" data-nav="' + n.id + '">' +
+        ICON[n.icon] + "<span>" + n.label + "</span>" + badge + "</button>";
     }).join("");
   }
-  $("who").addEventListener("change", function () {
-    who = this.value;
-    localStorage.setItem(LS_WHO, who);
-    renderAll();
-  });
-
-  document.querySelectorAll("#tabs .tab").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      activeTab = btn.dataset.tab;
-      document.querySelectorAll("#tabs .tab").forEach(function (b) { b.classList.toggle("active", b === btn); });
-      ["today", "clients", "team", "schedule", "links"].forEach(function (v) {
-        $("view-" + v).classList.toggle("hidden", v !== activeTab);
-      });
-      renderAll();
-      window.scrollTo(0, 0);
-    });
-  });
-
-  // ---------- owner mode ----------
-  function ownerLogin(onSuccess) {
-    var label = cloud ? "Owner password" : "PIN";
-    openModal(
-      "<h3>Owner login</h3>" +
-      "<label>" + label + "</label>" +
-      '<input type="password" id="pin-in" autocomplete="current-password">' +
-      (cloud ? '<p class="hint">This is your Supabase owner password — it stays signed in on this device.</p>' : "") +
-      '<div class="modal-actions"><button class="btn btn-outline-dark" data-close>Cancel</button>' +
-      '<button class="btn btn-gold" id="pin-go">Unlock</button></div>'
-    );
-    var input = $("pin-in");
-    input.focus();
-    function done() {
-      closeModal();
-      toast("Owner mode on — edit away ✳");
-      renderAll();
-      if (onSuccess) onSuccess();
-    }
-    function go() {
-      var v = input.value.trim();
-      if (!v) return;
-      if (cloud) {
-        $("pin-go").textContent = "…";
-        sb.auth.signInWithPassword({ email: cfg.OWNER_LOGIN_EMAIL || state.settings.ownerEmail || "alise@claudeandco.design", password: v })
-          .then(function (res) {
-            if (res.error) {
-              $("pin-go").textContent = "Unlock";
-              input.value = "";
-              input.placeholder = "Nope — try again";
-              return;
-            }
-            ownerFlag = true;
-            seedCloudIfEmpty();
-            done();
-          });
-      } else {
-        if (v === String(state.settings.ownerPin)) {
-          sessionStorage.setItem(SS_OWNER, "1");
-          done();
-        } else {
-          input.value = "";
-          input.placeholder = "Nope — try again";
-        }
-      }
-    }
-    $("pin-go").addEventListener("click", go);
-    input.addEventListener("keydown", function (e) { if (e.key === "Enter") go(); });
+  function paintConnection() {
+    var f = $("nav-foot");
+    if (!f) return;
+    f.innerHTML = '<div class="live"><span class="live-dot' + (connected ? "" : " off") + '"></span>' +
+      (connected ? "Live — synced" : cloudReady ? "Reconnecting…" : "Offline copy") + "</div>";
   }
-  $("owner-btn").addEventListener("click", function () {
-    if (isOwner()) return;
-    ownerLogin();
-  });
-  $("lock-btn").addEventListener("click", function () {
-    if (cloud) { ownerFlag = false; sb.auth.signOut(); }
-    else sessionStorage.removeItem(SS_OWNER);
-    toast("Locked. View-only now.");
-    renderAll();
-  });
-
-  function renderOwnerUI() {
-    $("owner-bar").classList.toggle("hidden", !isOwner());
-    $("owner-btn").classList.toggle("hidden", isOwner());
-    $("publish-btn").classList.toggle("hidden", cloud || !isOwner());
-    $("owner-bar-text").textContent = cloud
-      ? "✳ Owner mode — edits save live for the whole team."
-      : "✳ Owner mode — you can edit everything.";
+  function paintOwnerBar() {
+    var on = isOwner();
+    $("owner-bar").classList.toggle("hidden", !on && me.role !== "employee");
+    $("owner-btn").classList.toggle("hidden", !!me.role);
+    if (me.role === "employee") {
+      $("owner-bar-label").textContent = "Signed in as " + (member(me.memberId) || {}).name + (DB.settings.employeesCanCheck ? " — you can tick off your own tasks." : " — view only.");
+      $("settings-btn").classList.add("hidden");
+    } else if (on) {
+      $("owner-bar-label").textContent = "Owner mode — changes save live for the team.";
+      $("settings-btn").classList.remove("hidden");
+    }
+  }
+  function paintWho() {
+    var m = member(who);
+    if (me.role) {
+      var mm = member(me.memberId) || m;
+      $("who-wrap").innerHTML = mm ? '<span class="who-chip">' + avatar(mm, "sm") + esc(mm.name) + "</span>" : "";
+      return;
+    }
+    $("who-wrap").innerHTML = '<button class="who-chip" data-whopick>' + avatar(m, "sm") + esc(m ? m.name : "Who?") + "</button>";
   }
 
-  // ---------- modal plumbing ----------
+  /* ══════════ modal ══════════ */
   function openModal(html) {
     $("modal").innerHTML = html;
     $("modal-backdrop").classList.remove("hidden");
-    $("modal").querySelectorAll("[data-close]").forEach(function (b) {
-      b.addEventListener("click", closeModal);
-    });
+    $("modal").querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", closeModal); });
+    document.body.style.overflow = "hidden";
   }
   function closeModal() {
     $("modal-backdrop").classList.add("hidden");
     $("modal").innerHTML = "";
-    if (pendingCloudState) {
-      state = pendingCloudState;
-      pendingCloudState = null;
-      cacheLocal();
-      renderAll();
-    }
+    document.body.style.overflow = "";
   }
-  $("modal-backdrop").addEventListener("click", function (e) {
-    if (e.target === this) closeModal();
+  $("modal-backdrop").addEventListener("click", function (e) { if (e.target === this) closeModal(); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { closeModal(); closeSearch(); }
+    if (e.key === "/" && document.activeElement === document.body) { e.preventDefault(); focusSearch(); }
   });
 
-  // ---------- progress ----------
-  function progressFor(list) {
-    var total = list.length;
-    var done = list.filter(function (t) { return t.status === "done"; }).length;
-    return { done: done, total: total, pct: total ? Math.round(done / total * 100) : 0 };
+  function segHTML(id, opts, cur) {
+    return '<div class="seg" id="' + id + '">' + opts.map(function (o) {
+      return '<button data-v="' + esc(o.v) + '" class="' + (o.v === cur ? "on" : "") + '">' + esc(o.l) + "</button>";
+    }).join("") + "</div>";
   }
-  function progressCard(label, list, avatarM, mini) {
-    var p = progressFor(list);
-    var full = p.total > 0 && p.done === p.total;
-    return '<div class="progress-card">' +
-      '<div class="progress-top">' +
-        '<span class="progress-name">' + (avatarM ? avatarHtml(avatarM) + " " : "") + esc(label) + "</span>" +
-        '<span class="progress-pct' + (full ? " full" : "") + '">' + (full ? "100% 🎉" : p.pct + "%") + "</span>" +
-      "</div>" +
-      '<div class="bar' + (mini ? " mini" : "") + '"><div class="bar-fill' + (full ? " full" : "") + '" style="width:' + p.pct + '%"></div></div>' +
-      '<div class="progress-sub">' + p.done + " of " + p.total + " task" + (p.total === 1 ? "" : "s") + " done" + "</div>" +
-      "</div>";
-  }
-
-  // ---------- task rendering ----------
-  function statusIcon(st) { return st === "done" ? "✓" : st === "inprogress" ? "…" : ""; }
-  function cycleStatus(st) { return st === "todo" ? "inprogress" : st === "inprogress" ? "done" : "todo"; }
-
-  function taskRow(t, opts) {
-    opts = opts || {};
-    var m = member(t.assigneeId);
-    var c = client(t.clientId);
-    var overdue = isOverdue(t);
-    var bits = [];
-    if (!opts.hideClient && c) bits.push("<b>" + esc(c.name) + "</b>");
-    if (t.due) bits.push((overdue ? '<span class="pill overdue">overdue</span> ' : "") + fmtDate(t.due) + (t.time ? " · " + fmtTime(t.time) : ""));
-    if (t.kind === "shoot") bits.push('<span class="pill shoot">📷 shoot</span>');
-    if (t.location) bits.push("📍 " + esc(t.location));
-    if (m && !opts.hideWho) bits.push('<span class="who-chip" style="color:' + m.color + '">' + esc(m.name) + "</span>");
-    bits.push('<span class="pill ' + t.status + '">' + (t.status === "inprogress" ? "in progress" : t.status === "todo" ? "to do" : "done") + "</span>");
-
-    return '<div class="task' + (opts.inCard ? " in-card" : "") + (t.status === "done" ? " done-task" : "") + '" data-task="' + t.id + '">' +
-      '<button class="task-status-btn ' + t.status + '" data-cycle="' + t.id + '"' + (isOwner() ? "" : " disabled") +
-      ' title="' + (isOwner() ? "Click to move: to do → in progress → done" : "Only Alise can update status") + '">' + statusIcon(t.status) + "</button>" +
-      '<div class="task-main">' +
-        '<div class="task-title">' + esc(t.title) + "</div>" +
-        '<div class="task-meta">' + bits.join(" ") + "</div>" +
-        (t.notes ? '<div class="task-notes">' + esc(t.notes) + "</div>" : "") +
-      "</div>" +
-      (isOwner() ? '<button class="task-edit" data-edit="' + t.id + '" title="Edit">✎</button>' : "") +
-      "</div>";
-  }
-
-  function bindTaskButtons(root) {
-    root.querySelectorAll("[data-cycle]").forEach(function (b) {
+  function wireSeg(id, cb) {
+    var box = $(id); if (!box) return;
+    box.querySelectorAll("button").forEach(function (b) {
       b.addEventListener("click", function () {
-        if (!isOwner()) return;
-        var t = state.tasks.find(function (x) { return x.id === b.dataset.cycle; });
-        if (!t) return;
-        t.status = cycleStatus(t.status);
-        save();
-        renderAll();
+        box.querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
+        cb(b.getAttribute("data-v"));
       });
     });
-    root.querySelectorAll("[data-edit]").forEach(function (b) {
-      b.addEventListener("click", function () { taskForm(b.dataset.edit); });
-    });
   }
 
-  // ---------- task form (owner) ----------
-  function taskForm(taskId, presetClientId) {
-    var t = taskId ? state.tasks.find(function (x) { return x.id === taskId; }) : null;
-    var isNew = !t;
-    t = t || { id: uid(), clientId: presetClientId || (state.clients[0] && state.clients[0].id), title: "", assigneeId: "alise", due: todayStr(), time: "", status: "todo", kind: "task", location: "", notes: "" };
-
+  /* ── task form ── */
+  function taskForm(id, preset) {
+    var t = id ? task(id) : null, isNew = !t;
+    t = t ? JSON.parse(JSON.stringify(t)) : {
+      id: uid(), clientId: (preset && preset.clientId) || (DB.clients[0] || {}).id || "", title: "",
+      assigneeId: me.memberId || who, due: (preset && preset.due) || today(), time: "",
+      status: "todo", kind: (preset && preset.kind) || "task", location: "", notes: "", sort: Date.now() % 100000
+    };
     openModal(
       "<h3>" + (isNew ? "New task" : "Edit task") + "</h3>" +
-      "<label>What needs doing?</label>" +
-      '<input type="text" id="tf-title" value="' + esc(t.title) + '" placeholder="e.g. Draft captions for next week">' +
-      "<label>Type</label>" +
-      '<div class="seg" id="tf-kind">' +
-        '<button data-k="task" class="' + (t.kind === "task" ? "on" : "") + '">✓ Task</button>' +
-        '<button data-k="shoot" class="' + (t.kind === "shoot" ? "on" : "") + '">📷 Photoshoot</button>' +
-      "</div>" +
-      "<label>Client</label>" +
-      '<select id="tf-client">' + state.clients.filter(function (c) { return c.status !== "archived"; }).map(function (c) {
-        return '<option value="' + c.id + '"' + (c.id === t.clientId ? " selected" : "") + ">" + esc(c.name) + "</option>";
+      "<label>What needs doing?</label><input type='text' id='f-title' value='" + esc(t.title) + "' placeholder='e.g. Draft captions'>" +
+      "<label>Type</label>" + segHTML("f-kind", [{ v: "task", l: "✓ Task" }, { v: "shoot", l: "📷 Photoshoot" }], t.kind) +
+      "<label>Client</label><select id='f-client'><option value=''>— none —</option>" +
+        DB.clients.filter(function (c) { return c.status !== "archived"; }).map(function (c) {
+          return "<option value='" + esc(c.id) + "'" + (c.id === t.clientId ? " selected" : "") + ">" + esc(c.name) + "</option>";
+        }).join("") + "</select>" +
+      "<label>Assigned to</label><select id='f-who'>" + DB.members.map(function (m) {
+        return "<option value='" + esc(m.id) + "'" + (m.id === t.assigneeId ? " selected" : "") + ">" + esc(m.name) + "</option>";
       }).join("") + "</select>" +
-      "<label>Assigned to</label>" +
-      '<select id="tf-who">' + state.team.map(function (m) {
-        return '<option value="' + m.id + '"' + (m.id === t.assigneeId ? " selected" : "") + ">" + esc(m.name) + "</option>";
-      }).join("") + "</select>" +
-      "<label>Due date</label>" +
-      '<input type="date" id="tf-due" value="' + esc(t.due) + '">' +
-      '<div id="tf-shoot-fields" class="' + (t.kind === "shoot" ? "" : "hidden") + '">' +
-        "<label>Time</label>" + '<input type="time" id="tf-time" value="' + esc(t.time) + '">' +
-        "<label>Location</label>" + '<input type="text" id="tf-loc" value="' + esc(t.location) + '" placeholder="Where?">' +
-      "</div>" +
-      "<label>Status</label>" +
-      '<div class="seg" id="tf-status">' +
-        '<button data-s="todo" class="' + (t.status === "todo" ? "on" : "") + '">To do</button>' +
-        '<button data-s="inprogress" class="' + (t.status === "inprogress" ? "on" : "") + '">In progress</button>' +
-        '<button data-s="done" class="' + (t.status === "done" ? "on" : "") + '">Done</button>' +
-      "</div>" +
-      "<label>Notes</label>" +
-      '<textarea id="tf-notes" placeholder="Anything the team should know">' + esc(t.notes) + "</textarea>" +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
-        '<button class="btn btn-gold" id="tf-save">' + (isNew ? "Add it" : "Save") + "</button>" +
-      "</div>" +
-      (isNew ? "" : '<div class="danger-zone"><button class="btn-ghost" id="tf-del">Delete this task</button></div>')
+      "<label>Due</label><input type='date' id='f-due' value='" + esc(t.due) + "'>" +
+      "<div id='f-shoot' class='" + (t.kind === "shoot" ? "" : "hidden") + "'>" +
+        "<label>Time</label><input type='time' id='f-time' value='" + esc(t.time) + "'>" +
+        "<label>Location</label><input type='text' id='f-loc' value='" + esc(t.location) + "'>" + "</div>" +
+      "<label>Status</label>" + segHTML("f-status", [{ v: "todo", l: "To do" }, { v: "inprogress", l: "In progress" }, { v: "done", l: "Done" }], t.status) +
+      "<label>Notes</label><textarea id='f-notes'>" + esc(t.notes) + "</textarea>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='f-save'>" + (isNew ? "Add task" : "Save") + "</button></div>" +
+      (isNew ? "" : "<div class='danger-zone'><button class='btn btn-danger' id='f-del'>Delete task</button></div>")
     );
-
     var kind = t.kind, status = t.status;
-    $("tf-kind").querySelectorAll("button").forEach(function (b) {
-      b.addEventListener("click", function () {
-        kind = b.dataset.k;
-        $("tf-kind").querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
-        $("tf-shoot-fields").classList.toggle("hidden", kind !== "shoot");
-      });
-    });
-    $("tf-status").querySelectorAll("button").forEach(function (b) {
-      b.addEventListener("click", function () {
-        status = b.dataset.s;
-        $("tf-status").querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
-      });
-    });
-    $("tf-save").addEventListener("click", function () {
-      var title = $("tf-title").value.trim();
-      if (!title) { $("tf-title").focus(); return; }
-      t.title = title;
-      t.kind = kind;
-      t.status = status;
-      t.clientId = $("tf-client").value;
-      t.assigneeId = $("tf-who").value;
-      t.due = $("tf-due").value;
-      t.time = kind === "shoot" ? $("tf-time").value : "";
-      t.location = kind === "shoot" ? $("tf-loc").value.trim() : "";
-      t.notes = $("tf-notes").value.trim();
-      if (isNew) state.tasks.push(t);
-      save();
+    wireSeg("f-kind", function (v) { kind = v; $("f-shoot").classList.toggle("hidden", v !== "shoot"); });
+    wireSeg("f-status", function (v) { status = v; });
+    $("f-title").focus();
+    $("f-save").addEventListener("click", function () {
+      var title = $("f-title").value.trim();
+      if (!title) return $("f-title").focus();
+      t.title = title; t.kind = kind; t.status = status;
+      t.clientId = $("f-client").value; t.assigneeId = $("f-who").value; t.due = $("f-due").value;
+      t.time = kind === "shoot" ? $("f-time").value : "";
+      t.location = kind === "shoot" ? $("f-loc").value.trim() : "";
+      t.notes = $("f-notes").value.trim();
+      t.completedAt = status === "done" ? new Date().toISOString() : null;
       closeModal();
+      upsert("tasks", taskRow(t), t, "tasks");
+      logAct(isNew ? "added" : "updated", t.title);
       toast(isNew ? "Added ✳" : "Saved ✳");
-      renderAll();
     });
-    if (!isNew) {
-      $("tf-del").addEventListener("click", function () {
-        if (!confirm("Delete this task for good?")) return;
-        state.tasks = state.tasks.filter(function (x) { return x.id !== t.id; });
-        save();
-        closeModal();
-        toast("Deleted");
-        renderAll();
-      });
-    }
+    if (!isNew) $("f-del").addEventListener("click", function () {
+      if (!confirm("Delete this task?")) return;
+      closeModal(); removeRow("tasks", t.id, "tasks"); logAct("deleted", t.title); toast("Deleted");
+    });
   }
 
-  // ---------- client form (owner) ----------
-  function clientForm(clientId) {
-    var c = clientId ? client(clientId) : null;
-    var isNew = !c;
-    c = c || { id: uid(), name: "", status: "active", contact: "", email: "", phone: "", services: "", loomly: "", team: [], notes: "" };
+  /* ── task detail + comments ── */
+  function taskDetail(id) {
+    var t = task(id); if (!t) return;
+    var c = client(t.clientId), m = member(t.assigneeId);
+    var cs = DB.comments.filter(function (x) { return x.taskId === id; })
+      .sort(function (a, b) { return String(a.at).localeCompare(String(b.at)); });
+    var h = "<h3>" + esc(t.title) + "</h3><div class='modal-sub'>" +
+      (c ? esc(c.name) + " · " : "") + (t.due ? fDate(t.due) : "no date") + (t.time ? " · " + fTime(t.time) : "") + "</div>";
+    h += "<div style='display:flex;gap:7px;flex-wrap:wrap;margin-bottom:6px'>" +
+      "<span class='pill " + t.status + "'>" + (t.status === "inprogress" ? "in progress" : t.status) + "</span>" +
+      (t.kind === "shoot" ? "<span class='pill shoot'>📷 shoot</span>" : "") +
+      (isOverdue(t) ? "<span class='pill overdue'>late</span>" : "") + "</div>";
+    if (m) h += "<div class='row' style='display:flex;align-items:center;gap:7px;margin-top:8px'>" + avatar(m, "sm") + esc(m.full) + "</div>";
+    if (t.location) h += "<div class='row'>📍 " + esc(t.location) + "</div>";
+    if (t.notes) h += "<div class='note'>" + esc(t.notes) + "</div>";
 
+    h += "<label>Comments</label><div id='cmt-list'>" +
+      (cs.length ? cs.map(function (x) {
+        var cm = member(x.memberId);
+        return "<div class='cmt'>" + avatar(cm, "sm") + "<div class='cmt-body'>" +
+          "<div><span class='cmt-who'>" + esc(cm ? cm.name : "Someone") + "</span><span class='cmt-when'>" + ago(x.at) + "</span></div>" +
+          "<div class='cmt-text'>" + esc(x.body) + "</div></div></div>";
+      }).join("") : "<div class='hint'>No comments yet.</div>") + "</div>";
+    h += "<div class='quick-add' style='margin-top:10px'>" + ICON.chat +
+      "<input type='text' id='cmt-in' placeholder='Add a comment…' enterkeyhint='send'></div>";
+    h += "<div class='modal-actions'>" +
+      (canCheck(t) ? "<button class='btn btn-soft' id='d-cycle'>Move to " + (cycle(t.status) === "inprogress" ? "in progress" : cycle(t.status)) + "</button>" : "") +
+      (isOwner() ? "<button class='btn btn-soft' id='d-edit'>Edit</button>" : "") +
+      "<button class='btn btn-primary' data-close>Close</button></div>";
+    openModal(h);
+    var input = $("cmt-in");
+    function send() {
+      var body = input.value.trim(); if (!body) return;
+      input.value = "";
+      var row = { task_id: id, member_id: me.memberId || who, body: body };
+      if (!cloudReady) { DB.comments.push({ id: uid(), taskId: id, memberId: who, body: body, at: new Date().toISOString() }); taskDetail(id); return; }
+      sb.from("comments").insert(row).then(function (r) {
+        if (r.error) return fail("Couldn't post that comment");
+        return sb.from("comments").select("*").eq("task_id", id).then(function (res) {
+          if (!res.error) {
+            DB.comments = DB.comments.filter(function (x) { return x.taskId !== id; }).concat((res.data || []).map(mCmt));
+          }
+          taskDetail(id);
+        });
+      });
+    }
+    input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
+    var dc = $("d-cycle");
+    if (dc) dc.addEventListener("click", function () { toggleStatus(id); closeModal(); });
+    var de = $("d-edit");
+    if (de) de.addEventListener("click", function () { taskForm(id); });
+  }
+
+  /* ── client form + detail ── */
+  function clientForm(id) {
+    var c = id ? client(id) : null, isNew = !c;
+    c = c ? JSON.parse(JSON.stringify(c)) : { id: uid(), name: "", status: "active", contact: "", email: "", phone: "", services: "", loomly: "", team: [], notes: "", sort: Date.now() % 100000 };
     openModal(
       "<h3>" + (isNew ? "New client" : "Edit client") + "</h3>" +
-      "<label>Business name</label>" + '<input type="text" id="cf-name" value="' + esc(c.name) + '">' +
-      "<label>Status</label>" +
-      '<div class="seg" id="cf-status">' +
-        '<button data-s="active" class="' + (c.status === "active" ? "on" : "") + '">Active</button>' +
-        '<button data-s="pending" class="' + (c.status === "pending" ? "on" : "") + '">Pending</button>' +
-        '<button data-s="archived" class="' + (c.status === "archived" ? "on" : "") + '">Past client</button>' +
-      "</div>" +
-      "<label>Contact person</label>" + '<input type="text" id="cf-contact" value="' + esc(c.contact) + '">' +
-      "<label>Email</label>" + '<input type="text" id="cf-email" value="' + esc(c.email) + '">' +
-      "<label>Phone</label>" + '<input type="text" id="cf-phone" value="' + esc(c.phone) + '">' +
-      "<label>Services</label>" + '<input type="text" id="cf-services" value="' + esc(c.services) + '">' +
-      "<label>Loomly / calendar name</label>" + '<input type="text" id="cf-loomly" value="' + esc(c.loomly) + '">' +
+      "<label>Business name</label><input type='text' id='c-name' value='" + esc(c.name) + "'>" +
+      "<label>Status</label>" + segHTML("c-status", [{ v: "active", l: "Active" }, { v: "pending", l: "Pending" }, { v: "archived", l: "Past client" }], c.status) +
+      "<label>Contact</label><input type='text' id='c-contact' value='" + esc(c.contact) + "'>" +
+      "<label>Email</label><input type='text' id='c-email' value='" + esc(c.email) + "'>" +
+      "<label>Phone</label><input type='text' id='c-phone' value='" + esc(c.phone) + "'>" +
+      "<label>Services</label><input type='text' id='c-serv' value='" + esc(c.services) + "'>" +
+      "<label>Calendar name</label><input type='text' id='c-loomly' value='" + esc(c.loomly) + "'>" +
       "<label>Team on this client</label>" +
-      '<div class="seg" id="cf-team">' + state.team.map(function (m) {
-        return '<button data-m="' + m.id + '" class="' + (c.team.indexOf(m.id) >= 0 ? "on" : "") + '">' + esc(m.name) + "</button>";
+      "<div class='seg' id='c-team'>" + DB.members.map(function (m) {
+        return "<button data-m='" + esc(m.id) + "' class='" + (c.team.indexOf(m.id) >= 0 ? "on" : "") + "'>" + esc(m.name) + "</button>";
       }).join("") + "</div>" +
-      "<label>Notes</label>" + '<textarea id="cf-notes">' + esc(c.notes) + "</textarea>" +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
-        '<button class="btn btn-gold" id="cf-save">' + (isNew ? "Add client" : "Save") + "</button>" +
-      "</div>"
+      "<label>Notes</label><textarea id='c-notes'>" + esc(c.notes) + "</textarea>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='c-save'>" + (isNew ? "Add client" : "Save") + "</button></div>" +
+      (isNew ? "" : "<div class='danger-zone'><button class='btn btn-danger' id='c-del'>Delete client</button></div>")
     );
-
-    var status = c.status;
-    var teamSel = c.team.slice();
-    $("cf-status").querySelectorAll("button").forEach(function (b) {
+    var status = c.status, team = c.team.slice();
+    wireSeg("c-status", function (v) { status = v; });
+    $("c-team").querySelectorAll("button").forEach(function (b) {
       b.addEventListener("click", function () {
-        status = b.dataset.s;
-        $("cf-status").querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
-      });
-    });
-    $("cf-team").querySelectorAll("button").forEach(function (b) {
-      b.addEventListener("click", function () {
-        var id = b.dataset.m;
-        var i = teamSel.indexOf(id);
-        if (i >= 0) teamSel.splice(i, 1); else teamSel.push(id);
+        var mid = b.getAttribute("data-m"), i = team.indexOf(mid);
+        if (i >= 0) team.splice(i, 1); else team.push(mid);
         b.classList.toggle("on", i < 0);
       });
     });
-    $("cf-save").addEventListener("click", function () {
-      var name = $("cf-name").value.trim();
-      if (!name) { $("cf-name").focus(); return; }
-      c.name = name;
-      c.status = status;
-      c.contact = $("cf-contact").value.trim();
-      c.email = $("cf-email").value.trim();
-      c.phone = $("cf-phone").value.trim();
-      c.services = $("cf-services").value.trim();
-      c.loomly = $("cf-loomly").value.trim();
-      c.team = teamSel;
-      c.notes = $("cf-notes").value.trim();
-      if (isNew) state.clients.push(c);
-      save();
-      closeModal();
+    $("c-name").focus();
+    $("c-save").addEventListener("click", function () {
+      var name = $("c-name").value.trim(); if (!name) return $("c-name").focus();
+      c.name = name; c.status = status; c.team = team;
+      c.contact = $("c-contact").value.trim(); c.email = $("c-email").value.trim();
+      c.phone = $("c-phone").value.trim(); c.services = $("c-serv").value.trim();
+      c.loomly = $("c-loomly").value.trim(); c.notes = $("c-notes").value.trim();
+      closeModal(); upsert("clients", clientRow(c), c, "clients");
+      logAct(isNew ? "added client" : "updated client", c.name);
       toast(isNew ? "Client added ✳" : "Saved ✳");
-      renderAll();
+    });
+    if (!isNew) $("c-del").addEventListener("click", function () {
+      if (!confirm("Delete " + c.name + "? Their tasks stay but lose the client label.")) return;
+      closeModal(); removeRow("clients", c.id, "clients"); toast("Deleted");
     });
   }
-
-  // ---------- employee form (owner) ----------
-  var AVATAR_COLORS = ["#c96f85", "#7fa387", "#5b7f68", "#b98d6f", "#8a7fa3", "#c9976f"];
-  function memberForm(memberId) {
-    var m = memberId ? member(memberId) : null;
-    var isNew = !m;
-    m = m || { id: uid(), name: "", full: "", role: "", color: AVATAR_COLORS[state.team.length % AVATAR_COLORS.length], isOwner: false, email: "", info: "" };
-
-    openModal(
-      "<h3>" + (isNew ? "New employee" : "Edit employee") + "</h3>" +
-      "<label>First name (shows on tasks)</label>" + '<input type="text" id="mf-name" value="' + esc(m.name) + '">' +
-      "<label>Full name</label>" + '<input type="text" id="mf-full" value="' + esc(m.full) + '">' +
-      "<label>Role</label>" + '<input type="text" id="mf-role" value="' + esc(m.role) + '" placeholder="e.g. Photoshoots · captions">' +
-      "<label>Email</label>" + '<input type="text" id="mf-email" value="' + esc(m.email || "") + '">' +
-      "<label>Info / notes (visible to the whole team)</label>" +
-      '<textarea id="mf-info">' + esc(m.info || "") + "</textarea>" +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
-        '<button class="btn btn-gold" id="mf-save">' + (isNew ? "Add employee" : "Save") + "</button>" +
-      "</div>" +
-      (isNew || m.isOwner ? "" : '<div class="danger-zone"><button class="btn-ghost" id="mf-del">Remove this employee</button></div>')
-    );
-
-    $("mf-save").addEventListener("click", function () {
-      var name = $("mf-name").value.trim();
-      if (!name) { $("mf-name").focus(); return; }
-      m.name = name;
-      m.full = $("mf-full").value.trim() || name;
-      m.role = $("mf-role").value.trim();
-      m.email = $("mf-email").value.trim();
-      m.info = $("mf-info").value.trim();
-      if (isNew) state.team.push(m);
-      save();
-      closeModal();
-      toast(isNew ? "Welcome aboard, " + m.name + " ✳" : "Saved ✳");
-      renderAll();
-    });
-    var del = $("mf-del");
-    if (del) del.addEventListener("click", function () {
-      var open = state.tasks.filter(function (t) { return t.assigneeId === m.id && t.status !== "done"; }).length;
-      if (!confirm("Remove " + m.name + "?" + (open ? " They still have " + open + " open task(s) — those will show as unassigned until you reassign them." : ""))) return;
-      state.team = state.team.filter(function (x) { return x.id !== m.id; });
-      state.clients.forEach(function (c) { c.team = c.team.filter(function (id) { return id !== m.id; }); });
-      if (who === m.id) { who = "alise"; localStorage.setItem(LS_WHO, who); }
-      save();
-      closeModal();
-      toast("Removed");
-      renderAll();
-    });
-  }
-
-  // ---------- link form (owner) ----------
-  function linkForm(linkId) {
-    var l = linkId ? state.links.find(function (x) { return x.id === linkId; }) : null;
-    var isNew = !l;
-    l = l || { id: uid(), name: "", emoji: "🔗", desc: "", url: "" };
-
-    openModal(
-      "<h3>" + (isNew ? "Add a link" : "Edit link") + "</h3>" +
-      "<label>Name</label>" + '<input type="text" id="lf-name" value="' + esc(l.name) + '" placeholder="e.g. Dropbox">' +
-      "<label>Emoji</label>" + '<input type="text" id="lf-emoji" value="' + esc(l.emoji) + '" placeholder="📁">' +
-      "<label>What is it for?</label>" + '<input type="text" id="lf-desc" value="' + esc(l.desc) + '">' +
-      "<label>Web address</label>" + '<input type="text" id="lf-url" value="' + esc(l.url) + '" placeholder="https://…">' +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
-        '<button class="btn btn-gold" id="lf-save">' + (isNew ? "Add link" : "Save") + "</button>" +
-      "</div>" +
-      (isNew ? "" : '<div class="danger-zone"><button class="btn-ghost" id="lf-del">Delete this link</button></div>')
-    );
-
-    $("lf-save").addEventListener("click", function () {
-      var name = $("lf-name").value.trim();
-      var url = $("lf-url").value.trim();
-      if (!name) { $("lf-name").focus(); return; }
-      if (!url) { $("lf-url").focus(); return; }
-      if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-      l.name = name;
-      l.emoji = $("lf-emoji").value.trim() || "🔗";
-      l.desc = $("lf-desc").value.trim();
-      l.url = url;
-      if (isNew) state.links.push(l);
-      save();
-      closeModal();
-      toast(isNew ? "Link added ✳" : "Saved ✳");
-      renderAll();
-    });
-    var del = $("lf-del");
-    if (del) del.addEventListener("click", function () {
-      if (!confirm("Delete the " + l.name + " link?")) return;
-      state.links = state.links.filter(function (x) { return x.id !== l.id; });
-      save();
-      closeModal();
-      toast("Deleted");
-      renderAll();
-    });
-  }
-
-  // ---------- time off ----------
-  function fmtRange(a, b) {
-    return a === b || !b ? fmtDate(a) : fmtDate(a) + " – " + fmtDate(b);
-  }
-  function b64e(s) { return btoa(unescape(encodeURIComponent(s))); }
-  function b64d(s) { return decodeURIComponent(escape(atob(s))); }
-
-  function timeoffForm(entryId) {
-    var owner = isOwner();
-    var e0 = entryId ? state.timeoff.find(function (x) { return x.id === entryId; }) : null;
-    var isNew = !e0;
-    var e = e0 ? JSON.parse(JSON.stringify(e0)) : { id: uid(), memberId: owner ? state.team[0].id : who, start: todayStr(), end: todayStr(), reason: "", status: owner ? "approved" : "requested" };
-
-    openModal(
-      "<h3>" + (owner ? (isNew ? "Add time off" : "Edit time off") : "Request time off") + "</h3>" +
-      (owner
-        ? "<label>Who</label><select id='to-who'>" + state.team.map(function (m) {
-            return '<option value="' + m.id + '"' + (m.id === e.memberId ? " selected" : "") + ">" + esc(m.name) + "</option>";
-          }).join("") + "</select>"
-        : (cloud
-            ? "<p style='font-size:14px;margin:0 0 4px'>Your request goes straight to Alise's Team tab — she'll approve or deny it there.</p>"
-            : "<p style='font-size:14px;margin:0 0 4px'>This sends an email to Alise and notes your request here on your device.</p>")) +
-      "<label>First day off</label>" + '<input type="date" id="to-start" value="' + esc(e.start) + '">' +
-      "<label>Last day off</label>" + '<input type="date" id="to-end" value="' + esc(e.end) + '">' +
-      "<label>Reason (optional)</label>" + '<input type="text" id="to-reason" value="' + esc(e.reason) + '" placeholder="e.g. family trip">' +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
-        '<button class="btn btn-gold" id="to-save">' + (owner ? "Save" : "Send request") + "</button>" +
-      "</div>" +
-      (owner && !isNew ? '<div class="danger-zone"><button class="btn-ghost" id="to-del">Delete</button></div>' : "")
-    );
-
-    $("to-save").addEventListener("click", function () {
-      var start = $("to-start").value;
-      var end = $("to-end").value || start;
-      if (!start) { $("to-start").focus(); return; }
-      if (end < start) end = start;
-      e.start = start;
-      e.end = end;
-      e.reason = $("to-reason").value.trim();
-      if (owner) {
-        e.memberId = $("to-who").value;
-        if (isNew) e.status = "approved";
-        closeModal();
-        toOwnerUpsert(e, isNew).then(function () { if (!cloud) toast("Time off saved ✳"); else toast("Saved 🌴"); });
-      } else {
-        e.memberId = who;
-        e.status = "requested";
-        closeModal();
-        toSubmitRequest(e).then(function () {
-          var m = member(who);
-          var subject = "Time off request — " + (m ? m.full : "team");
-          var body;
-          if (cloud) {
-            body = "Hi Alise!\n\nJust a heads-up — I submitted a time off request in Studio HQ:\n\nFrom: " + fmtDate(start) +
-              "\nThrough: " + fmtDate(end) +
-              (e.reason ? "\nReason: " + e.reason : "") +
-              "\n\nIt's waiting on your Team tab.\n\nThank you!\n" + (m ? m.name : "");
-            toast("Request sent 🌴 — an email heads-up just opened too");
-          } else {
-            var reqLink = location.origin + location.pathname + "?req=" +
-              encodeURIComponent(b64e(JSON.stringify({ m: who, s: start, e: end, r: e.reason })));
-            body = "Hi Alise!\n\nI'd like to request time off:\n\nFrom: " + fmtDate(start) +
-              "\nThrough: " + fmtDate(end) +
-              (e.reason ? "\nReason: " + e.reason : "") +
-              "\n\nApprove or deny it here:\n" + reqLink +
-              "\n\nThank you!\n" + (m ? m.name : "");
-            toast("Almost done — hit Send in the email that just opened ✉️");
-          }
-          window.location.href = "mailto:" + encodeURIComponent(state.settings.ownerEmail || "alise@claudeandco.design") +
-            "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
-        });
-      }
-    });
-    var del = $("to-del");
-    if (del) del.addEventListener("click", function () {
-      if (!confirm("Delete this time off entry?")) return;
-      closeModal();
-      toDelete(e.id);
-    });
-  }
-
-  function timeoffRow(e) {
-    var m = member(e.memberId);
-    return '<div class="timeoff-row">' +
-      '<span class="to-emoji">🌴</span>' +
-      (m ? avatarHtml(m) : "") +
-      '<span style="flex:1"><b>' + esc(m ? m.name : "?") + "</b> off " + fmtRange(e.start, e.end) +
-      (e.reason ? ' <span style="color:var(--muted)">· ' + esc(e.reason) + "</span>" : "") + "</span>" +
-      '<span class="pill ' + (e.status === "approved" ? "timeoff" : e.status === "denied" ? "denied" : "requested") + '">' + e.status + "</span>" +
-      (isOwner()
-        ? (e.status === "requested"
-            ? '<button class="btn btn-dark btn-sm" data-to-approve="' + e.id + '">Approve</button>' +
-              '<button class="btn btn-rust btn-sm" data-to-deny="' + e.id + '">Deny</button>'
-            : "") +
-          '<button class="task-edit" data-to-edit="' + e.id + '" title="Edit">✎</button>'
-        : "") +
-      "</div>";
-  }
-  function bindTimeoffButtons(root) {
-    root.querySelectorAll("[data-to-approve]").forEach(function (b) {
-      b.addEventListener("click", function () { toSetStatus(b.dataset.toApprove, "approved", "Approved 🌴"); });
-    });
-    root.querySelectorAll("[data-to-deny]").forEach(function (b) {
-      b.addEventListener("click", function () { toSetStatus(b.dataset.toDeny, "denied", "Denied — let them know 💬"); });
-    });
-    root.querySelectorAll("[data-to-edit]").forEach(function (b) {
-      b.addEventListener("click", function () { timeoffForm(b.dataset.toEdit); });
-    });
-  }
-
-  // ---------- views ----------
-  function avatarHtml(m, big) {
-    if (!m) return "";
-    return '<span class="avatar' + (big ? " big" : "") + '" style="background:' + m.color + '" title="' + esc(m.full) + '">' +
-      esc(m.name.slice(0, 2).toUpperCase()) + "</span>";
-  }
-  function openTasks() { return state.tasks.filter(function (t) { return t.status !== "done"; }); }
-  function mineFilter(list) {
-    return list.filter(function (t) { return t.assigneeId === who; });
-  }
-  function sortTasks(list) {
-    return list.slice().sort(function (a, b) {
-      return (a.due || "9999").localeCompare(b.due || "9999") || (a.time || "").localeCompare(b.time || "");
-    });
-  }
-  function mineToggle(view) {
-    var m = member(who);
-    return '<div class="filter-row">' +
-      '<button class="chip-toggle' + (mineOnly[view] ? "" : " on") + '" data-mine="0">Everyone</button>' +
-      '<button class="chip-toggle' + (mineOnly[view] ? " on" : "") + '" data-mine="1">Just ' + esc(m ? m.name : "me") + "</button>" +
-      "</div>";
-  }
-  function bindMineToggle(root, view) {
-    root.querySelectorAll("[data-mine]").forEach(function (b) {
-      b.addEventListener("click", function () {
-        mineOnly[view] = b.dataset.mine === "1";
-        renderAll();
-      });
-    });
-  }
-
-  function renderToday() {
-    var v = $("view-today");
-    var m = member(who);
-    var today = todayStr();
-    var all = state.tasks;
-    var pool = mineOnly.today ? mineFilter(all) : all;
-
-    var dueToday = sortTasks(pool.filter(function (t) { return t.due === today && t.status !== "done"; }));
-    var overdue = sortTasks(pool.filter(isOverdue));
-    var inprog = pool.filter(function (t) { return t.status === "inprogress"; });
-    var weekEnd = new Date(); weekEnd.setDate(weekEnd.getDate() + 7);
-    var weekEndStr = weekEnd.getFullYear() + "-" + String(weekEnd.getMonth() + 1).padStart(2, "0") + "-" + String(weekEnd.getDate()).padStart(2, "0");
-    var shootsWeek = sortTasks(pool.filter(function (t) { return t.kind === "shoot" && t.status !== "done" && t.due && t.due >= today && t.due <= weekEndStr; }));
-
-    var dateLine = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
-
-    var html =
-      "<h2>" + greeting() + ", " + esc(m ? m.name : "friend") + " 🌸</h2>" +
-      '<p class="view-sub">' + dateLine + "</p>" +
-      mineToggle("today") +
-      '<div class="stats">' +
-        '<div class="stat' + (overdue.length ? " warn" : " go") + '"><div class="n">' + overdue.length + '</div><div class="l">Overdue</div></div>' +
-        '<div class="stat gold"><div class="n">' + dueToday.length + '</div><div class="l">Due today</div></div>' +
-        '<div class="stat"><div class="n">' + inprog.length + '</div><div class="l">In progress</div></div>' +
-        '<div class="stat"><div class="n">' + shootsWeek.length + '</div><div class="l">Shoots this week</div></div>' +
-      "</div>" +
-      '<div class="section-label">Progress to 100%</div>' +
-      progressCard((m ? m.name : "You"), state.tasks.filter(function (t) { return t.assigneeId === who; }), m) +
-      progressCard("The whole team", state.tasks, null);
-
-    if (overdue.length) {
-      html += '<div class="section-label">Needs attention</div>' + overdue.map(function (t) { return taskRow(t); }).join("");
-    }
-
-    html += '<div class="section-label">Today, client by client' +
-      (isOwner() ? ' <button class="btn btn-dark btn-sm" data-newtask>+ Task</button>' : "") + "</div>";
-
-    var todays = sortTasks(pool.filter(function (t) { return t.due === today; }));
-    if (!todays.length) {
-      html += '<div class="empty">Nothing due today' + (mineOnly.today ? " for you" : "") + ". Lovely. 🌿</div>";
-    } else {
-      var byClient = {};
-      todays.forEach(function (t) { (byClient[t.clientId] = byClient[t.clientId] || []).push(t); });
-      state.clients.forEach(function (c) {
-        var list = byClient[c.id];
-        if (!list) return;
-        html += '<div class="card"><div class="card-head"><h3 class="card-title">' + esc(c.name) + "</h3>" +
-          '<span class="avatars">' + c.team.map(function (id) { return avatarHtml(member(id)); }).join("") + "</span></div>" +
-          list.map(function (t) { return taskRow(t, { hideClient: true, inCard: true }); }).join("") +
-          "</div>";
-      });
-    }
-
-    if (shootsWeek.length) {
-      html += '<div class="section-label">Shoots this week</div>' +
-        shootsWeek.map(function (t) { return taskRow(t); }).join("");
-    }
-
-    v.innerHTML = html;
-    bindTaskButtons(v);
-    bindMineToggle(v, "today");
-    var nb = v.querySelector("[data-newtask]");
-    if (nb) nb.addEventListener("click", function () { taskForm(null); });
-  }
-
-  function renderClients() {
-    var v = $("view-clients");
-    var actives = state.clients.filter(function (c) { return c.status !== "archived"; });
-    var archived = state.clients.filter(function (c) { return c.status === "archived"; });
-
-    var html = "<h2>Clients</h2>" +
-      '<p class="view-sub">' + actives.length + " on the books · tap a card to see everything</p>";
-    if (isOwner()) html += '<div class="filter-row"><button class="btn btn-dark btn-sm" data-newclient>+ New client</button></div>';
-
-    html += '<div class="client-grid">' + actives.map(clientCard).join("") + "</div>";
-
-    if (archived.length) {
-      html += '<div class="section-label">Past clients</div><div class="client-grid">' + archived.map(clientCard).join("") + "</div>";
-    }
-    v.innerHTML = html;
-
-    function clientCard(c) {
-      var open = openTasks().filter(function (t) { return t.clientId === c.id; });
-      var od = open.filter(isOverdue).length;
-      return '<div class="card" data-client="' + c.id + '" style="cursor:pointer">' +
-        '<div class="card-head"><div><h3 class="card-title">' + esc(c.name) + "</h3>" +
-        '<div class="card-sub">' + esc(c.services || "") + "</div></div>" +
-        '<span class="pill ' + c.status + '">' + statusLabel(c.status) + "</span></div>" +
-        '<div class="meta-row"><span class="avatars">' + c.team.map(function (id) { return avatarHtml(member(id)); }).join("") + "</span> " +
-        "&nbsp;" + open.length + " open task" + (open.length === 1 ? "" : "s") +
-        (od ? ' · <span style="color:var(--rose-deep);font-weight:700">' + od + " overdue</span>" : "") + "</div>" +
-        "</div>";
-    }
-
-    v.querySelectorAll("[data-client]").forEach(function (card) {
-      card.addEventListener("click", function () { clientDetail(card.dataset.client); });
-    });
-    var nb = v.querySelector("[data-newclient]");
-    if (nb) nb.addEventListener("click", function () { clientForm(null); });
-  }
-
-  function clientDetail(cid) {
-    var c = client(cid);
-    if (!c) return;
-    var list = sortTasks(state.tasks.filter(function (t) { return t.clientId === cid; }));
+  function clientDetail(id) {
+    var c = client(id); if (!c) return;
+    var list = sortT(live().filter(function (t) { return t.clientId === id; }));
     var open = list.filter(function (t) { return t.status !== "done"; });
     var done = list.filter(function (t) { return t.status === "done"; });
+    var h = "<div class='card-head'><h3>" + esc(c.name) + "</h3><span class='pill " + c.status + "'>" + statusLabel(c.status) + "</span></div>";
+    if (c.contact) h += "<div class='row'><b>Contact:</b> " + esc(c.contact) + "</div>";
+    if (c.email) h += "<div class='row'><b>Email:</b> <a href='mailto:" + esc(c.email) + "'>" + esc(c.email) + "</a></div>";
+    if (c.phone) h += "<div class='row'><b>Phone:</b> <a href='tel:" + esc(c.phone.replace(/[^0-9+]/g, "")) + "'>" + esc(c.phone) + "</a></div>";
+    if (c.services) h += "<div class='row'><b>Services:</b> " + esc(c.services) + "</div>";
+    if (c.loomly) h += "<div class='row'><b>Calendar:</b> " + esc(c.loomly) + "</div>";
+    if (c.team.length) h += "<div class='row' style='display:flex;align-items:center;gap:8px;margin-top:8px'><span class='avatars'>" +
+      c.team.map(function (i) { return avatar(member(i), "sm"); }).join("") + "</span>" +
+      c.team.map(function (i) { var m = member(i); return m ? m.name : ""; }).filter(Boolean).join(" · ") + "</div>";
+    if (c.notes) h += "<div class='note'>" + esc(c.notes) + "</div>";
+    if (list.length) h += "<div style='margin-top:14px'>" + progCard("Progress", list, "client-" + id, null) + "</div>";
+    h += "<label>Open work</label>";
+    h += open.length ? open.map(function (t) { return taskHTML(t, { hideClient: true }); }).join("") : "<div class='hint'>Nothing open.</div>";
+    if (done.length) h += "<label>Done</label>" + done.map(function (t) { return taskHTML(t, { hideClient: true }); }).join("");
+    h += "<div class='modal-actions'>" +
+      (isOwner() ? "<button class='btn btn-soft' id='cd-add'>+ Task</button><button class='btn btn-soft' id='cd-edit'>Edit</button>" : "") +
+      "<button class='btn btn-primary' data-close>Close</button></div>";
+    if (isOwner()) h += "<div class='danger-zone'><button class='btn btn-ghost' id='cd-arch'>" +
+      (c.status === "archived" ? "🌱 Make active again" : "📁 Move to past clients") + "</button></div>";
+    openModal(h);
+    var a = $("cd-add"); if (a) a.addEventListener("click", function () { taskForm(null, { clientId: id }); });
+    var e = $("cd-edit"); if (e) e.addEventListener("click", function () { clientForm(id); });
+    var ar = $("cd-arch"); if (ar) ar.addEventListener("click", function () {
+      var real = client(id);
+      real.status = real.status === "archived" ? "active" : "archived";
+      closeModal(); upsert("clients", clientRow(real), real, "clients");
+      logAct(real.status === "archived" ? "archived client" : "reactivated client", real.name);
+      toast(real.status === "archived" ? real.name + " → past clients 📁" : real.name + " is active again 🌱");
+    });
+  }
 
-    var html = '<div class="card-head"><h3 style="margin:0;font-size:22px">' + esc(c.name) + "</h3>" +
-      '<span class="pill ' + c.status + '">' + statusLabel(c.status) + "</span></div>";
-    if (c.contact) html += '<div class="meta-row"><b>Contact:</b> ' + esc(c.contact) + "</div>";
-    if (c.email) html += '<div class="meta-row"><b>Email:</b> <a href="mailto:' + esc(c.email) + '">' + esc(c.email) + "</a></div>";
-    if (c.phone) html += '<div class="meta-row"><b>Phone:</b> <a href="tel:' + esc(c.phone.replace(/[^0-9+]/g, "")) + '">' + esc(c.phone) + "</a></div>";
-    if (c.services) html += '<div class="meta-row"><b>Services:</b> ' + esc(c.services) + "</div>";
-    if (c.loomly) html += '<div class="meta-row"><b>Calendar:</b> ' + esc(c.loomly) + "</div>";
-    if (c.team.length) html += '<div class="meta-row" style="margin-top:6px"><span class="avatars">' + c.team.map(function (id) { return avatarHtml(member(id)); }).join("") + "</span> &nbsp;" +
-      c.team.map(function (id) { var mm = member(id); return mm ? mm.name : ""; }).filter(Boolean).join(" · ") + "</div>";
-    if (c.notes) html += '<div class="task-notes" style="margin-top:8px">' + esc(c.notes) + "</div>";
-
-    if (list.length) html += progressCard("Progress for " + c.name, list, null, true);
-
-    html += '<div class="section-label" style="margin-top:16px">Open' +
-      (isOwner() ? ' <button class="btn btn-dark btn-sm" id="cd-add">+ Task</button>' : "") + "</div>";
-    html += open.length ? open.map(function (t) { return taskRow(t, { hideClient: true }); }).join("") : '<div class="empty">Nothing open.</div>';
-    if (done.length) {
-      html += '<div class="section-label">Done</div>' + done.map(function (t) { return taskRow(t, { hideClient: true }); }).join("");
-    }
-    html += '<div class="modal-actions">' +
-      (isOwner() ? '<button class="btn btn-outline-dark" id="cd-edit">Edit client</button>' : "") +
-      '<button class="btn btn-gold" data-close>Close</button></div>';
-    if (isOwner()) {
-      html += '<div class="danger-zone"><button class="btn-ghost" id="cd-archive">' +
-        (c.status === "archived" ? "🌱 Make active again" : "📁 Move to past clients") + "</button></div>";
-    }
-
-    openModal(html);
-    bindTaskButtons($("modal"));
-    var add = $("cd-add");
-    if (add) add.addEventListener("click", function () { taskForm(null, cid); });
-    var ed = $("cd-edit");
-    if (ed) ed.addEventListener("click", function () { clientForm(cid); });
-    var arch = $("cd-archive");
-    if (arch) arch.addEventListener("click", function () {
-      c.status = c.status === "archived" ? "active" : "archived";
-      save();
+  /* ── member / link / timeoff forms ── */
+  var COLORS = ["#c4667c", "#7ea287", "#4f7460", "#b98d6f", "#8a7fa3", "#c9976f"];
+  function memberForm(id) {
+    var m = id ? member(id) : null, isNew = !m;
+    m = m ? JSON.parse(JSON.stringify(m)) : { id: uid(), name: "", full: "", role: "", color: COLORS[DB.members.length % COLORS.length], email: "", info: "", isOwner: false, sort: DB.members.length };
+    openModal("<h3>" + (isNew ? "New employee" : "Edit employee") + "</h3>" +
+      "<label>First name</label><input type='text' id='m-name' value='" + esc(m.name) + "'>" +
+      "<label>Full name</label><input type='text' id='m-full' value='" + esc(m.full) + "'>" +
+      "<label>Role</label><input type='text' id='m-role' value='" + esc(m.role) + "'>" +
+      "<label>Email</label><input type='text' id='m-email' value='" + esc(m.email) + "'>" +
+      "<label>Notes (whole team sees this)</label><textarea id='m-info'>" + esc(m.info) + "</textarea>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='m-save'>" + (isNew ? "Add" : "Save") + "</button></div>" +
+      (isNew || m.isOwner ? "" : "<div class='danger-zone'><button class='btn btn-danger' id='m-del'>Remove</button></div>"));
+    $("m-name").focus();
+    $("m-save").addEventListener("click", function () {
+      var n = $("m-name").value.trim(); if (!n) return $("m-name").focus();
+      m.name = n; m.full = $("m-full").value.trim() || n; m.role = $("m-role").value.trim();
+      m.email = $("m-email").value.trim(); m.info = $("m-info").value.trim();
+      closeModal(); upsert("members", memberRow(m), m, "members"); toast(isNew ? "Welcome, " + m.name + " ✳" : "Saved ✳");
+    });
+    var d = $("m-del"); if (d) d.addEventListener("click", function () {
+      if (!confirm("Remove " + m.name + "?")) return;
+      closeModal(); removeRow("members", m.id, "members"); toast("Removed");
+    });
+  }
+  function linkForm(id) {
+    var l = id ? DB.links.filter(function (x) { return x.id === id; })[0] : null, isNew = !l;
+    l = l ? JSON.parse(JSON.stringify(l)) : { id: uid(), name: "", emoji: "🔗", desc: "", url: "", sort: DB.links.length };
+    openModal("<h3>" + (isNew ? "Add link" : "Edit link") + "</h3>" +
+      "<label>Name</label><input type='text' id='l-name' value='" + esc(l.name) + "'>" +
+      "<label>Emoji</label><input type='text' id='l-emoji' value='" + esc(l.emoji) + "'>" +
+      "<label>What is it for?</label><input type='text' id='l-desc' value='" + esc(l.desc) + "'>" +
+      "<label>Web address</label><input type='text' id='l-url' value='" + esc(l.url) + "' placeholder='https://…'>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='l-save'>" + (isNew ? "Add" : "Save") + "</button></div>" +
+      (isNew ? "" : "<div class='danger-zone'><button class='btn btn-danger' id='l-del'>Delete</button></div>"));
+    $("l-name").focus();
+    $("l-save").addEventListener("click", function () {
+      var n = $("l-name").value.trim(), u = $("l-url").value.trim();
+      if (!n) return $("l-name").focus();
+      if (!u) return $("l-url").focus();
+      if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+      l.name = n; l.url = u; l.emoji = $("l-emoji").value.trim() || "🔗"; l.desc = $("l-desc").value.trim();
+      closeModal(); upsert("links", linkRow(l), l, "links"); toast(isNew ? "Link added ✳" : "Saved ✳");
+    });
+    var d = $("l-del"); if (d) d.addEventListener("click", function () {
+      if (!confirm("Delete the " + l.name + " link?")) return;
+      closeModal(); removeRow("links", l.id, "links"); toast("Deleted");
+    });
+  }
+  function offForm(id) {
+    var owner = isOwner();
+    var e0 = id ? DB.timeoff.filter(function (x) { return x.id === id; })[0] : null, isNew = !e0;
+    var e = e0 ? JSON.parse(JSON.stringify(e0)) : { id: uid(), memberId: owner ? DB.members[0].id : (me.memberId || who), start: today(), end: today(), reason: "", status: owner ? "approved" : "requested" };
+    openModal("<h3>" + (owner ? (isNew ? "Add time off" : "Edit time off") : "Request time off") + "</h3>" +
+      (owner ? "<label>Who</label><select id='o-who'>" + DB.members.map(function (m) {
+        return "<option value='" + esc(m.id) + "'" + (m.id === e.memberId ? " selected" : "") + ">" + esc(m.name) + "</option>";
+      }).join("") + "</select>"
+      : "<div class='modal-sub'>This goes straight to Alise's Team tab for approval.</div>") +
+      "<label>First day</label><input type='date' id='o-start' value='" + esc(e.start) + "'>" +
+      "<label>Last day</label><input type='date' id='o-end' value='" + esc(e.end) + "'>" +
+      "<label>Reason (optional)</label><input type='text' id='o-reason' value='" + esc(e.reason) + "'>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='o-save'>" + (owner ? "Save" : "Send request") + "</button></div>" +
+      (owner && !isNew ? "<div class='danger-zone'><button class='btn btn-danger' id='o-del'>Delete</button></div>" : ""));
+    $("o-save").addEventListener("click", function () {
+      var s = $("o-start").value, en = $("o-end").value || s;
+      if (!s) return $("o-start").focus();
+      if (en < s) en = s;
+      e.start = s; e.end = en; e.reason = $("o-reason").value.trim();
+      if (owner) e.memberId = $("o-who").value; else { e.memberId = me.memberId || who; e.status = "requested"; }
       closeModal();
-      toast(c.status === "archived" ? c.name + " moved to past clients 📁" : c.name + " is active again 🌱");
-      renderAll();
+      var row = { member_id: e.memberId, start_day: e.start, end_day: e.end, reason: e.reason, status: e.status };
+      if (!cloudReady) { if (isNew) DB.timeoff.push(e); render(); return; }
+      var q = isNew ? sb.from("timeoff").insert(row) : sb.from("timeoff").update(row).eq("id", e.id);
+      q.then(function (r) {
+        if (r.error) return fail(owner ? "Couldn't save" : "Couldn't send — try again");
+        toast(owner ? "Saved 🌴" : "Request sent 🌴 — Alise will see it");
+        return refreshOff();
+      });
     });
-    $("modal").querySelectorAll("[data-cycle]").forEach(function (b) {
-      b.addEventListener("click", function () { setTimeout(function () { clientDetail(cid); }, 0); });
+    var d = $("o-del"); if (d) d.addEventListener("click", function () {
+      if (!confirm("Delete this time off?")) return;
+      closeModal(); removeRow("timeoff", e.id, "timeoff"); toast("Deleted");
+    });
+  }
+  function refreshOff() {
+    if (!cloudReady) return Promise.resolve();
+    return sb.from("timeoff").select("*").order("start_day").then(function (r) {
+      if (!r.error) { DB.timeoff = (r.data || []).map(mOff); render(); }
+    });
+  }
+  function decideOff(id, status) {
+    var e = DB.timeoff.filter(function (x) { return x.id === id; })[0];
+    if (e) { e.status = status; scheduleRender(); }
+    var m = e && member(e.memberId);
+    logAct(status === "approved" ? "approved time off for" : "denied time off for", m ? m.name : "");
+    if (!cloudReady) return;
+    sb.from("timeoff").update({ status: status, decided_at: new Date().toISOString() }).eq("id", id).select("id")
+      .then(function (r) { if (wrote(r, "Couldn't update — are you still signed in?")) toast(status === "approved" ? "Approved 🌴" : "Denied — let them know"); });
+  }
+
+  /* ── settings ── */
+  function settingsModal() {
+    var doneOld = live().filter(function (t) { return t.status === "done" && t.completedAt && (Date.now() - new Date(t.completedAt).getTime()) > 30 * 864e5; }).length;
+    openModal("<h3>Settings</h3>" +
+      "<label>Studio password (whole team)</label><input type='text' id='s-code' value='" + esc(DB.settings.accessCode || "") + "'>" +
+      "<label>Owner email (for notifications)</label><input type='text' id='s-email' value='" + esc(DB.settings.ownerEmail || "") + "'>" +
+      "<div class='switch-row' style='margin-top:18px'><div><div class='switch-txt'>Let employees tick off their own tasks</div>" +
+      "<div class='hint' style='margin:2px 0 0'>They still can't edit or delete anything.</div></div>" +
+      "<button class='switch" + (DB.settings.employeesCanCheck ? " on" : "") + "' id='s-emp'></button></div>" +
+      "<label>Housekeeping</label>" +
+      "<button class='btn btn-soft btn-block' id='s-tidy'" + (doneOld ? "" : " disabled") + ">Archive " + doneOld + " task" + (doneOld === 1 ? "" : "s") + " finished over 30 days ago</button>" +
+      "<div class='hint'>Archiving keeps your progress bars honest — archived tasks stay in the database but drop off the boards.</div>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='s-save'>Save</button></div>" +
+      "<div class='danger-zone'><button class='btn btn-ghost' id='s-backup'>Download a backup</button></div>");
+    var emp = !!DB.settings.employeesCanCheck;
+    $("s-emp").addEventListener("click", function () { emp = !emp; this.classList.toggle("on", emp); });
+    $("s-tidy").addEventListener("click", function () {
+      var olds = live().filter(function (t) { return t.status === "done" && t.completedAt && (Date.now() - new Date(t.completedAt).getTime()) > 30 * 864e5; });
+      olds.forEach(function (t) { t.archived = true; });
+      closeModal(); scheduleRender();
+      if (cloudReady) Promise.all(olds.map(function (t) { return sb.from("tasks").update({ archived: true }).eq("id", t.id); }))
+        .then(function () { toast("Archived " + olds.length + " old task" + (olds.length === 1 ? "" : "s")); });
+    });
+    $("s-save").addEventListener("click", function () {
+      DB.settings.accessCode = $("s-code").value.trim() || DB.settings.accessCode;
+      DB.settings.ownerEmail = $("s-email").value.trim();
+      DB.settings.employeesCanCheck = emp;
+      closeModal(); saveSettings().then(function () { toast("Settings saved 🌸"); render(); });
+    });
+    $("s-backup").addEventListener("click", function () {
+      var blob = new Blob([JSON.stringify(DB, null, 2)], { type: "application/json" });
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = "studio-hq-backup.json";
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 400);
+      toast("Backup downloaded");
     });
   }
 
-  function renderTeam() {
-    var v = $("view-team");
-    var today = todayStr();
-    var upcomingOff = state.timeoff
-      .filter(function (e) { return e.end >= today; })
-      .sort(function (a, b) { return String(a.start).localeCompare(String(b.start)); });
-
-    var html = "<h2>The team</h2>" +
-      '<p class="view-sub">Who\'s carrying what, and how far along everyone is</p>';
-
-    html += progressCard("Team progress", state.tasks, null);
-
-    html += '<div class="section-label">Time off' +
-      (isOwner()
-        ? ' <button class="btn btn-dark btn-sm" id="to-add">+ Add time off</button>'
-        : ' <button class="btn btn-dark btn-sm" id="to-request">🌴 Request time off</button>') +
-      "</div>";
-    html += upcomingOff.length
-      ? upcomingOff.map(timeoffRow).join("")
-      : '<div class="empty">No time off coming up.</div>';
-
-    html += '<div class="section-label">Everyone' +
-      (isOwner() ? ' <button class="btn btn-dark btn-sm" id="mf-add">+ Employee</button>' : "") + "</div>";
-
-    state.team.forEach(function (m) {
-      var mineAll = state.tasks.filter(function (t) { return t.assigneeId === m.id; });
-      var mine = sortTasks(mineAll.filter(function (t) { return t.status !== "done"; }));
-      var shoots = mine.filter(function (t) { return t.kind === "shoot"; });
-      html += '<div class="card">' +
-        '<div class="card-head"><div style="display:flex;align-items:center;gap:10px">' + avatarHtml(m, true) +
-        "<div><h3 class='card-title'>" + esc(m.full) + "</h3><div class='card-sub'>" + esc(m.role) + "</div></div></div>" +
-        '<span style="display:flex;gap:6px;align-items:center">' +
-          '<span class="pill todo">' + mine.length + " open</span>" +
-          (isOwner() ? '<button class="task-edit" data-mf-edit="' + m.id + '" title="Edit">✎</button>' : "") +
-        "</span></div>" +
-        (m.email ? '<div class="meta-row"><b>Email:</b> <a href="mailto:' + esc(m.email) + '">' + esc(m.email) + "</a></div>" : "") +
-        (m.info ? '<div class="task-notes" style="margin-bottom:8px">' + esc(m.info) + "</div>" : "") +
-        progressCard(m.name + "'s progress", mineAll, null, true) +
-        (mine.length
-          ? mine.map(function (t) { return taskRow(t, { hideWho: true, inCard: true }); }).join("")
-          : '<div class="empty">All clear 🌿</div>') +
-        (shoots.length ? '<div class="card-sub" style="margin-top:4px">📷 ' + shoots.length + " shoot" + (shoots.length === 1 ? "" : "s") + " coming up</div>" : "") +
-        "</div>";
+  /* ── daily digest email ── */
+  function digest() {
+    var td = today(), lines = [];
+    DB.members.forEach(function (m) {
+      var mine = sortT(live().filter(function (t) { return t.assigneeId === m.id && t.status !== "done" && t.due && t.due <= td; }));
+      if (!mine.length) return;
+      lines.push(m.name + ":");
+      mine.forEach(function (t) {
+        var c = client(t.clientId);
+        lines.push("  • " + t.title + (c ? " (" + c.name + ")" : "") +
+          (isOverdue(t) ? " — OVERDUE " + fDate(t.due) : "") + (t.time ? " at " + fTime(t.time) : ""));
+      });
+      lines.push("");
     });
-    v.innerHTML = html;
-    bindTaskButtons(v);
-    bindTimeoffButtons(v);
-    var toAdd = $("to-add");
-    if (toAdd) toAdd.addEventListener("click", function () { timeoffForm(null); });
-    var toReq = $("to-request");
-    if (toReq) toReq.addEventListener("click", function () { timeoffForm(null); });
-    var mfAdd = $("mf-add");
-    if (mfAdd) mfAdd.addEventListener("click", function () { memberForm(null); });
-    v.querySelectorAll("[data-mf-edit]").forEach(function (b) {
-      b.addEventListener("click", function () { memberForm(b.dataset.mfEdit); });
-    });
-  }
-
-  function renderSchedule() {
-    var v = $("view-schedule");
-    var today = todayStr();
-    var pool = mineOnly.schedule ? mineFilter(state.tasks) : state.tasks;
-    var upcoming = sortTasks(pool.filter(function (t) { return t.status !== "done" && t.due && t.due >= today; }));
-    var byDay = {};
-    upcoming.forEach(function (t) { (byDay[t.due] = byDay[t.due] || { tasks: [], off: [] }).tasks.push(t); });
-    state.timeoff.forEach(function (e) {
-      if (e.status !== "approved" || e.end < today) return;
-      if (mineOnly.schedule && e.memberId !== who) return;
-      var key = e.start >= today ? e.start : today;
-      (byDay[key] = byDay[key] || { tasks: [], off: [] }).off.push(e);
-    });
-    var days = Object.keys(byDay).sort();
-
-    var html = "<h2>Schedule</h2>" +
-      '<p class="view-sub">Shoots, deadlines, and time off — day by day</p>' +
-      mineToggle("schedule") +
-      (isOwner() ? '<div class="filter-row"><button class="btn btn-dark btn-sm" data-newshoot>+ Schedule a shoot</button></div>' : "");
-
-    if (!days.length) {
-      html += '<div class="empty">Nothing on the calendar yet.</div>';
+    var offToday = DB.timeoff.filter(function (e) { return e.status === "approved" && e.start <= td && e.end >= td; });
+    if (offToday.length) {
+      lines.push("Out today: " + offToday.map(function (e) { var m = member(e.memberId); return m ? m.name : ""; }).join(", "));
     }
-    days.forEach(function (day) {
-      var isToday = day === today;
-      html += '<div class="day-group"><div class="day-head' + (isToday ? " today-head" : "") + '">' +
-        '<span class="dow">' + fmtDow(day) + "</span> " + fmtDate(day) +
-        (isToday ? ' <span class="today-flag">today</span>' : "") + "</div>" +
-        byDay[day].off.map(timeoffRow).join("") +
-        byDay[day].tasks.map(function (t) { return taskRow(t); }).join("") + "</div>";
-    });
-    v.innerHTML = html;
-    bindTaskButtons(v);
-    bindTimeoffButtons(v);
-    bindMineToggle(v, "schedule");
-    var nb = v.querySelector("[data-newshoot]");
-    if (nb) nb.addEventListener("click", function () {
-      taskForm(null);
-      var shootBtn = document.querySelector('#tf-kind [data-k="shoot"]');
-      if (shootBtn) shootBtn.click();
-    });
+    if (!lines.length) lines.push("Nothing outstanding — enjoy the day!");
+    var body = "Morning team,\n\nHere's today (" + new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }) + "):\n\n" +
+      lines.join("\n") + "\n— Alise\n";
+    var to = DB.members.filter(function (m) { return m.email && !m.isOwner; }).map(function (m) { return m.email; }).join(",");
+    window.location.href = "mailto:" + encodeURIComponent(to) + "?subject=" +
+      encodeURIComponent("Studio HQ — today's plan") + "&body=" + encodeURIComponent(body);
   }
 
-  function renderLinks() {
-    var v = $("view-links");
-    v.innerHTML = "<h2>Studio links</h2>" +
-      '<p class="view-sub">Every tool we use, one tap away</p>' +
-      (isOwner() ? '<div class="filter-row"><button class="btn btn-dark btn-sm" id="lf-add">+ Add link</button></div>' : "") +
-      '<div class="links-grid">' + state.links.map(function (l) {
-        return '<a class="link-card" href="' + esc(l.url) + '" target="_blank" rel="noopener">' +
-          '<div class="emoji">' + esc(l.emoji) + '</div><div class="name">' + esc(l.name) + '</div>' +
-          '<div class="desc">' + esc(l.desc) + "</div>" +
-          (isOwner() ? '<button class="link-edit" data-lf-edit="' + l.id + '" title="Edit">✎</button>' : "") +
-          "</a>";
-      }).join("") + "</div>";
-    var add = $("lf-add");
-    if (add) add.addEventListener("click", function () { linkForm(null); });
-    v.querySelectorAll("[data-lf-edit]").forEach(function (b) {
-      b.addEventListener("click", function (ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        linkForm(b.dataset.lfEdit);
+  /* ══════════ board drag (mouse + touch) ══════════ */
+  var drag = null;
+  function wireDrag() {
+    if (!isOwner()) return;
+    $("view").querySelectorAll(".bcard").forEach(function (card) {
+      card.addEventListener("pointerdown", function (ev) {
+        if (ev.button != null && ev.button !== 0) return;
+        var startX = ev.clientX, startY = ev.clientY, moved = false, ghost = null;
+        var id = card.getAttribute("data-card");
+        card.setPointerCapture(ev.pointerId);
+
+        function onMove(e) {
+          var dx = e.clientX - startX, dy = e.clientY - startY;
+          if (!moved && Math.abs(dx) + Math.abs(dy) < 7) return;
+          if (!moved) {
+            moved = true;
+            var r = card.getBoundingClientRect();
+            ghost = card.cloneNode(true);
+            ghost.className = "bcard bcard-ghost";
+            ghost.style.width = r.width + "px";
+            ghost.style.left = r.left + "px";
+            ghost.style.top = r.top + "px";
+            document.body.appendChild(ghost);
+            card.classList.add("dragging");
+            drag = { id: id, ghost: ghost, offX: startX - r.left, offY: startY - r.top };
+          }
+          ghost.style.left = (e.clientX - drag.offX) + "px";
+          ghost.style.top = (e.clientY - drag.offY) + "px";
+          ghost.style.display = "none";
+          var under = document.elementFromPoint(e.clientX, e.clientY);
+          ghost.style.display = "";
+          var col = under && under.closest ? under.closest(".col") : null;
+          $("view").querySelectorAll(".col").forEach(function (c) { c.classList.toggle("drop", c === col); });
+        }
+        function onUp(e) {
+          card.releasePointerCapture(ev.pointerId);
+          card.removeEventListener("pointermove", onMove);
+          card.removeEventListener("pointerup", onUp);
+          card.removeEventListener("pointercancel", onUp);
+          if (!moved) { taskDetail(id); return; }
+          if (drag && drag.ghost) drag.ghost.remove();
+          card.classList.remove("dragging");
+          drag.ghost.style.display = "none";
+          var under = document.elementFromPoint(e.clientX, e.clientY);
+          var col = under && under.closest ? under.closest(".col") : null;
+          $("view").querySelectorAll(".col").forEach(function (c) { c.classList.remove("drop"); });
+          drag = null;
+          if (!col) return render();
+          var status = col.getAttribute("data-col");
+          var t = task(id);
+          if (!t || t.status === status) return render();
+          t.status = status;
+          t.completedAt = status === "done" ? new Date().toISOString() : null;
+          t.sort = Date.now() % 100000;
+          render();
+          if (status === "done") logAct("completed", t.title);
+          if (cloudReady) sb.from("tasks").update({ status: status, completed_at: t.completedAt, sort: t.sort }).eq("id", id).select("id")
+            .then(function (r) { wrote(r, "Couldn't move that — are you still signed in?"); });
+        }
+        card.addEventListener("pointermove", onMove);
+        card.addEventListener("pointerup", onUp);
+        card.addEventListener("pointercancel", onUp);
       });
     });
   }
 
-  // ---------- publish / settings (owner) ----------
-  function download(filename, text) {
-    var a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  /* ══════════ search ══════════ */
+  function searchAll(q) {
+    q = q.trim().toLowerCase();
+    if (!q) return [];
+    var out = [];
+    DB.clients.forEach(function (c) {
+      if ((c.name + " " + c.contact + " " + c.services).toLowerCase().indexOf(q) >= 0)
+        out.push({ kind: "client", title: c.name, sub: c.services || statusLabel(c.status), go: function () { clientDetail(c.id); } });
+    });
+    live().forEach(function (t) {
+      var c = client(t.clientId);
+      if ((t.title + " " + t.notes + " " + (c ? c.name : "")).toLowerCase().indexOf(q) >= 0)
+        out.push({ kind: t.kind === "shoot" ? "shoot" : "task", title: t.title, sub: (c ? c.name + " · " : "") + (t.due ? fDate(t.due) : ""), go: function () { taskDetail(t.id); } });
+    });
+    DB.members.forEach(function (m) {
+      if ((m.name + " " + m.full + " " + m.role).toLowerCase().indexOf(q) >= 0)
+        out.push({ kind: "person", title: m.full, sub: m.role, go: function () { go("team"); } });
+    });
+    DB.links.forEach(function (l) {
+      if ((l.name + " " + l.desc).toLowerCase().indexOf(q) >= 0)
+        out.push({ kind: "link", title: l.name, sub: l.desc, go: function () { window.open(l.url, "_blank", "noopener"); } });
+    });
+    return out.slice(0, 24);
+  }
+  function resultsHTML(res) {
+    if (!res.length) return "<div class='empty'>Nothing matches that.</div>";
+    return res.map(function (r, i) {
+      return "<button class='sr-item' data-res='" + i + "'><span class='sr-kind'>" + r.kind + "</span>" +
+        "<span class='sr-main'><span class='sr-title'>" + esc(r.title) + "</span>" +
+        "<span class='sr-sub'>" + esc(r.sub || "") + "</span></span></button>";
+    }).join("");
+  }
+  var lastRes = [];
+  function runSearch(q, host) {
+    lastRes = searchAll(q);
+    host.innerHTML = resultsHTML(lastRes);
+    host.querySelectorAll("[data-res]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var r = lastRes[+b.getAttribute("data-res")];
+        closeSearch(); if (r) r.go();
+      });
+    });
+  }
+  var panel = null;
+  function focusSearch() {
+    if (window.innerWidth < 900) { openSearch(); return; }
+    $("search").focus();
+  }
+  function openSearch() {
+    $("search-overlay").classList.remove("hidden");
+    $("search-mobile").value = "";
+    $("search-results").innerHTML = "";
+    setTimeout(function () { $("search-mobile").focus(); }, 40);
+  }
+  function closeSearch() {
+    $("search-overlay").classList.add("hidden");
+    if (panel) { panel.remove(); panel = null; }
+  }
+  $("search-btn").addEventListener("click", openSearch);
+  $("search-close").addEventListener("click", closeSearch);
+  $("search-mobile").addEventListener("input", function () { runSearch(this.value, $("search-results")); });
+  $("search").addEventListener("input", function () {
+    var q = this.value;
+    if (!q.trim()) { if (panel) { panel.remove(); panel = null; } return; }
+    if (!panel) { panel = el("<div class='search-panel'></div>"); $("search").parentNode.appendChild(panel); }
+    runSearch(q, panel);
+  });
+  $("search").addEventListener("blur", function () { setTimeout(function () { if (panel) { panel.remove(); panel = null; } }, 180); });
+
+  /* ══════════ navigation & delegated events ══════════ */
+  function go(v) { view = v; closeSearch(); render(); window.scrollTo(0, 0); }
+
+  document.addEventListener("click", function (ev) {
+    var t = ev.target.closest ? ev.target : ev.target.parentElement;
+    if (!t || !t.closest) return;
+    var hit;
+    if ((hit = t.closest("[data-nav]"))) return go(hit.getAttribute("data-nav"));
+    if ((hit = t.closest("[data-toggle]"))) { ev.stopPropagation(); return toggleStatus(hit.getAttribute("data-toggle")); }
+    if ((hit = t.closest("[data-open]"))) { ev.stopPropagation(); return taskDetail(hit.getAttribute("data-open")); }
+    if ((hit = t.closest("[data-edit]"))) { ev.stopPropagation(); return taskForm(hit.getAttribute("data-edit")); }
+    if ((hit = t.closest("[data-client]"))) return clientDetail(hit.getAttribute("data-client"));
+    if ((hit = t.closest("[data-editmember]"))) return memberForm(hit.getAttribute("data-editmember"));
+    if ((hit = t.closest("[data-editlink]"))) { ev.preventDefault(); ev.stopPropagation(); return linkForm(hit.getAttribute("data-editlink")); }
+    if ((hit = t.closest("[data-editoff]"))) return offForm(hit.getAttribute("data-editoff"));
+    if ((hit = t.closest("[data-approve]"))) return decideOff(hit.getAttribute("data-approve"), "approved");
+    if ((hit = t.closest("[data-deny]"))) return decideOff(hit.getAttribute("data-deny"), "denied");
+    if ((hit = t.closest("[data-mine]"))) { mineOnly = hit.getAttribute("data-mine") === "1"; return render(); }
+    if (t.closest("[data-newclient]")) return clientForm(null);
+    if (t.closest("[data-newmember]")) return memberForm(null);
+    if (t.closest("[data-newlink]")) return linkForm(null);
+    if (t.closest("[data-newshoot]")) return taskForm(null, { kind: "shoot" });
+    if (t.closest("[data-addoff]") || t.closest("[data-reqoff]")) return offForm(null);
+    if (t.closest("[data-digest]")) return digest();
+    if (t.closest("[data-whopick]")) return whoPicker();
+    if ((hit = t.closest("[data-jump]"))) {
+      var el2 = $(hit.getAttribute("data-jump"));
+      if (el2) el2.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+  });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Enter") return;
+    var inp = ev.target;
+    if (!inp || !inp.matches || !inp.matches("[data-quick]")) return;
+    var title = inp.value.trim(); if (!title) return;
+    inp.value = "";
+    var t = { id: uid(), clientId: "", title: title, assigneeId: me.memberId || who,
+      due: inp.getAttribute("data-due") || today(), time: "", status: "todo", kind: "task",
+      location: "", notes: "", sort: Date.now() % 100000, archived: false };
+    upsert("tasks", taskRow(t), t, "tasks");
+    logAct("added", title);
+    toast("Added ✳");
+  });
+
+  function whoPicker() {
+    openModal("<h3>Who's looking?</h3><div class='modal-sub'>This only changes what “just me” filters to.</div>" +
+      DB.members.map(function (m) {
+        return "<button class='sr-item' data-pick='" + esc(m.id) + "'>" + avatar(m, "sm") +
+          "<span class='sr-main'><span class='sr-title'>" + esc(m.full) + "</span><span class='sr-sub'>" + esc(m.role) + "</span></span></button>";
+      }).join("") +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Close</button></div>");
+    $("modal").querySelectorAll("[data-pick]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        who = b.getAttribute("data-pick");
+        localStorage.setItem(LS_WHO, who);
+        closeModal(); render();
+      });
+    });
   }
 
-  $("publish-btn").addEventListener("click", function () {
-    // Local-only mode fallback (cloud mode saves live and hides this button).
-    state.publishedAt = Date.now();
-    save();
-    var out = JSON.parse(JSON.stringify(state));
-    var file = "/* Claude & Co. Studio HQ — published data (" + new Date().toLocaleString() + ") */\n" +
-      "(function () { window.CCO_SEED = " + JSON.stringify(out, null, 2) + "; })();\n";
-    download("cco-hq-data.js", file);
-    openModal(
-      "<h3>Almost published 🌸</h3>" +
-      "<p style='font-size:14px'>A file called <b>cco-hq-data.js</b> just downloaded. It has everything you changed.</p>" +
-      "<p style='font-size:14px'>Now just tell Claude:</p>" +
-      "<p style='background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:12px;font-weight:700'>“Publish my Studio HQ updates”</p>" +
-      '<div class="modal-actions"><button class="btn btn-gold" data-close>Got it</button></div>'
-    );
+  $("fab").addEventListener("click", function () { taskForm(null); });
+  $("settings-btn").addEventListener("click", settingsModal);
+  $("lock-btn").addEventListener("click", function () {
+    if (cloudReady) sb.auth.signOut();
+    me = { userId: null, memberId: null, role: null };
+    toast("Locked — view only");
+    render();
   });
+  $("owner-btn").addEventListener("click", function () { login(); });
 
-  $("settings-btn").addEventListener("click", function () {
-    openModal(
-      "<h3>Settings</h3>" +
-      "<label>Studio password (whole team)</label>" +
-      '<input type="text" id="st-access" value="' + esc(state.settings.accessCode) + '">' +
-      (cloud
-        ? '<p class="hint">Your owner password is managed in Supabase (Authentication → Users), not here.</p>'
-        : "<label>Owner PIN (just you)</label>" +
-          '<input type="text" id="st-pin" value="' + esc(state.settings.ownerPin) + '">') +
-      "<label>Owner email (time-off requests go here)</label>" +
-      '<input type="text" id="st-email" value="' + esc(state.settings.ownerEmail || "") + '">' +
-      (cloud
-        ? '<p class="hint">Changes save live for everyone — tell the team if you change the studio password.</p>'
-        : '<p class="hint">If you change these, hit Publish so the live site gets the new ones — and tell the team the new password.</p>') +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-outline-dark" data-close>Cancel</button>' +
-        '<button class="btn btn-gold" id="st-save">Save</button>' +
-      "</div>" +
-      '<div class="danger-zone">' +
-        '<button class="btn-ghost" id="st-export">Download a backup</button>' +
-        (cloud ? "" : '<br><button class="btn-ghost" id="st-reset">Reset my device to the published version</button>') +
-      "</div>"
-    );
-    $("st-save").addEventListener("click", function () {
-      var ac = $("st-access").value.trim();
-      var em = $("st-email").value.trim();
-      if (ac) state.settings.accessCode = ac;
-      if (em) state.settings.ownerEmail = em;
-      if (!cloud) {
-        var pin = $("st-pin").value.trim();
-        if (pin) state.settings.ownerPin = pin;
-      }
-      save();
-      closeModal();
-      toast("Settings saved 🌸");
+  function login(after) {
+    openModal("<h3>Sign in</h3><div class='modal-sub'>Alise signs in here to edit. Employees can sign in too if you've made them an account.</div>" +
+      "<label>Email</label><input type='text' id='li-email' value='" + esc(cfg.OWNER_LOGIN_EMAIL || "") + "' autocomplete='username'>" +
+      "<label>Password</label><input type='password' id='li-pw' autocomplete='current-password'>" +
+      "<div class='modal-actions'><button class='btn btn-soft' data-close>Cancel</button>" +
+      "<button class='btn btn-primary' id='li-go'>Sign in</button></div>");
+    var pw = $("li-pw"); pw.focus();
+    function attempt() {
+      var email = $("li-email").value.trim(), p = pw.value;
+      if (!email || !p) return;
+      $("li-go").textContent = "…";
+      sb.auth.signInWithPassword({ email: email, password: p }).then(function (r) {
+        if (r.error) { $("li-go").textContent = "Sign in"; pw.value = ""; pw.placeholder = "Didn't work — try again"; return; }
+        closeModal();
+        return resolveRole().then(function () {
+          toast(isOwner() ? "Owner mode on ✳" : "Signed in ✳");
+          render(); if (after) after();
+        });
+      });
+    }
+    $("li-go").addEventListener("click", attempt);
+    pw.addEventListener("keydown", function (e) { if (e.key === "Enter") attempt(); });
+  }
+  function resolveRole() {
+    if (!cloudReady) return Promise.resolve();
+    return sb.auth.getUser().then(function (r) {
+      var u = r.data && r.data.user;
+      if (!u) { me = { userId: null, memberId: null, role: null }; return; }
+      me.userId = u.id;
+      return sb.from("app_users").select("member_id,role").eq("user_id", u.id).maybeSingle().then(function (res) {
+        if (res.data) { me.memberId = res.data.member_id; me.role = res.data.role; who = me.memberId || who; }
+        else { me.memberId = null; me.role = null; }
+      });
     });
-    $("st-export").addEventListener("click", function () {
-      download("cco-hq-backup.json", JSON.stringify(state, null, 2));
-      toast("Backup downloaded");
-    });
-    var rst = $("st-reset");
-    if (rst) rst.addEventListener("click", function () {
-      if (!confirm("Replace what's on this device with the published version?")) return;
-      localStorage.removeItem(LS_STATE);
-      state = loadState();
-      closeModal();
-      toast("Back to the published version");
-      renderAll();
-    });
-  });
+  }
 
-  // ---------- incoming time-off request link (old emails, local mode) ----------
+  /* ══════════ gate ══════════ */
+  function gateOK() { return localStorage.getItem(LS_ACCESS) === "1"; }
+  function showGate() {
+    $("gate").classList.remove("hidden");
+    $("app").classList.add("hidden");
+  }
+  function hideGate() {
+    $("gate").classList.add("hidden");
+    $("app").classList.remove("hidden");
+  }
+  function tryGate() {
+    var v = $("gate-input").value.trim().toLowerCase();
+    var code = String(DB.settings.accessCode || (window.CCO_SEED && window.CCO_SEED.settings.accessCode) || "goldenhour").toLowerCase();
+    if (v === code) { localStorage.setItem(LS_ACCESS, "1"); hideGate(); render(); }
+    else $("gate-err").classList.remove("hidden");
+  }
+  $("gate-btn").addEventListener("click", tryGate);
+  $("gate-input").addEventListener("keydown", function (e) { if (e.key === "Enter") tryGate(); });
+
+  /* ══════════ boot ══════════ */
+  function boot() {
+    if (gateOK()) hideGate(); else showGate();
+    Promise.resolve()
+      .then(function () { return cloudReady ? resolveRole() : null; })
+      .then(loadAll)
+      .then(function () {
+        loaded = true;
+        if (!DB.members.length) seedFromFile();
+        if (me.memberId) who = me.memberId;
+        paintConnection();
+        render();
+        subscribe();
+        handleRequestLink();
+      });
+    // refresh when the tab comes back, in case the socket dropped
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && cloudReady) loadAll().then(render);
+    });
+  }
+
+  /* legacy ?req= approval links from the old email flow */
   function handleRequestLink() {
     var raw = new URLSearchParams(location.search).get("req");
     if (!raw) return;
     history.replaceState(null, "", location.pathname);
-    var req;
-    try { req = JSON.parse(b64d(raw)); } catch (err) { return; }
-    if (!req || !req.s) return;
-    var m = member(req.m);
-    var name = m ? m.full : "Someone";
-
-    function decide(approve) {
-      if (!isOwner()) { ownerLogin(function () { decide(approve); }); return; }
-      var entry = { id: uid(), memberId: req.m, start: req.s, end: req.e || req.s, reason: req.r || "", status: approve ? "approved" : "denied" };
+    var d;
+    try { d = JSON.parse(decodeURIComponent(escape(atob(raw)))); } catch (e) { return; }
+    if (!d || !d.s) return;
+    var m = member(d.m);
+    openModal("<h3>🌴 Time off request</h3>" +
+      "<div class='off-row'>🌴" + avatar(m, "sm") + "<span class='flex'><b>" + esc(m ? m.name : "Someone") +
+      "</b> " + fDate(d.s) + (d.e && d.e !== d.s ? " – " + fDate(d.e) : "") +
+      (d.r ? " <span style='color:var(--muted)'>· " + esc(d.r) + "</span>" : "") + "</span></div>" +
+      "<div class='modal-actions'><button class='btn btn-soft' id='rq-deny'>Deny</button>" +
+      "<button class='btn btn-primary' id='rq-ok'>Approve 🌴</button></div>");
+    function decide(status) {
+      if (!isOwner()) { closeModal(); return login(function () { handleReq(status); }); }
+      handleReq(status);
+    }
+    function handleReq(status) {
       closeModal();
-      toOwnerUpsert(entry, true).then(function () {
-        toast(approve ? "Approved 🌴 — it's on the schedule" : "Denied — let them know 💬");
+      var row = { member_id: d.m, start_day: d.s, end_day: d.e || d.s, reason: d.r || "", status: status };
+      if (!cloudReady) return;
+      sb.from("timeoff").insert(row).then(function (r) {
+        if (r.error) return fail();
+        toast(status === "approved" ? "Approved 🌴" : "Denied");
+        refreshOff();
       });
     }
-
-    openModal(
-      "<h3>🌴 Time off request</h3>" +
-      '<div class="timeoff-row"><span class="to-emoji">🌴</span>' + (m ? avatarHtml(m) : "") +
-      "<span style='flex:1'><b>" + esc(name) + "</b> asks for " + fmtRange(req.s, req.e || req.s) +
-      (req.r ? ' <span style="color:var(--muted)">· ' + esc(req.r) + "</span>" : "") + "</span></div>" +
-      "<p class='hint'>You'll be asked for your owner login if it's off.</p>" +
-      '<div class="modal-actions">' +
-        '<button class="btn btn-rust" id="req-deny">Deny</button>' +
-        '<button class="btn btn-gold" id="req-approve">Approve 🌴</button>' +
-      "</div>" +
-      '<div class="danger-zone"><button class="btn-ghost" data-close>Decide later</button></div>'
-    );
-    $("req-approve").addEventListener("click", function () { decide(true); });
-    $("req-deny").addEventListener("click", function () { decide(false); });
+    $("rq-ok").addEventListener("click", function () { decide("approved"); });
+    $("rq-deny").addEventListener("click", function () { decide("denied"); });
   }
 
-  // ---------- boot ----------
-  function renderAll() {
-    renderOwnerUI();
-    renderWho();
-    if (activeTab === "today") renderToday();
-    if (activeTab === "clients") renderClients();
-    if (activeTab === "team") renderTeam();
-    if (activeTab === "schedule") renderSchedule();
-    if (activeTab === "links") renderLinks();
-  }
-
-  checkGate();
-  renderAll();
-
-  if (cloud) {
-    sb.auth.getSession().then(function (res) {
-      ownerFlag = !!(res.data && res.data.session);
-      renderAll();
-    });
-    sb.auth.onAuthStateChange(function (event, session) {
-      ownerFlag = !!session;
-      renderOwnerUI();
-    });
-    refreshCloud().then(handleRequestLink);
-    setInterval(function () {
-      if (document.visibilityState === "visible") refreshCloud();
-    }, 30000);
-    document.addEventListener("visibilitychange", function () {
-      if (document.visibilityState === "visible") refreshCloud();
-    });
-  } else {
-    handleRequestLink();
-  }
+  boot();
 })();

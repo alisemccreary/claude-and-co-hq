@@ -2,82 +2,112 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Claude &amp; Co. — Studio HQ</title>
 <meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#2f4739">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Studio HQ">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="assets/icon.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232f4739'/><text x='50' y='70' font-size='54' text-anchor='middle' fill='%23f0b6c0' font-family='Georgia' font-style='italic' font-weight='bold'>cl</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=Yellowtail&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="assets/style.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%232e4636'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='%23f2b8c1' font-family='Georgia' font-style='italic' font-weight='bold'>cl.</text></svg>">
 </head>
 <body>
 
-<!-- ======= ACCESS GATE ======= -->
+<!-- ============ ACCESS GATE ============ -->
 <div id="gate" class="gate hidden">
   <div class="gate-card">
-    <div class="logo-mark">cl<span class="dot">.</span><span class="star">✳</span></div>
+    <div class="gate-logo">cl<span>.</span></div>
     <h1>Claude &amp; Co.</h1>
-    <p class="gate-sub">Studio HQ — team access</p>
-    <input type="password" id="gate-input" placeholder="Studio password" autocomplete="off">
-    <button id="gate-btn" class="btn btn-gold">Come on in</button>
+    <p class="gate-sub">Studio HQ</p>
+    <input type="password" id="gate-input" placeholder="Studio password" autocomplete="off" enterkeyhint="go">
+    <button id="gate-btn" class="btn btn-primary btn-block">Come on in</button>
     <p id="gate-err" class="gate-err hidden">That's not it — ask Alise for the password.</p>
   </div>
 </div>
 
-<!-- ======= APP ======= -->
-<div id="app" class="hidden">
+<!-- ============ APP ============ -->
+<div id="app" class="app hidden">
 
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand">
-        <span class="logo-mark small">cl<span class="dot">.</span><span class="star">✳</span></span>
-        <div class="brand-text">
-          <span class="brand-name">Claude &amp; Co.</span>
-          <span class="brand-tag">Studio HQ</span>
-        </div>
-      </div>
-      <div class="topbar-actions">
-        <select id="who" class="who-select" title="Who's looking?"></select>
-        <button id="owner-btn" class="btn btn-outline-light btn-sm">Owner login</button>
-      </div>
+  <!-- sidebar (desktop) / bottom bar (mobile) -->
+  <nav class="nav" id="nav">
+    <div class="nav-brand">
+      <span class="nav-logo">cl<span>.</span></span>
+      <span class="nav-brand-text">
+        <b>Claude &amp; Co.</b>
+        <i>Studio HQ</i>
+      </span>
     </div>
-    <nav class="tabs" id="tabs">
-      <button class="tab active" data-tab="today">Today</button>
-      <button class="tab" data-tab="clients">Clients</button>
-      <button class="tab" data-tab="team">Team</button>
-      <button class="tab" data-tab="schedule">Schedule</button>
-      <button class="tab" data-tab="links">Links</button>
-    </nav>
-  </header>
+    <div class="nav-items" id="nav-items"></div>
+    <div class="nav-foot" id="nav-foot"></div>
+  </nav>
 
-  <div id="owner-bar" class="owner-bar hidden">
-    <span id="owner-bar-text">✳ Owner mode — you can edit everything.</span>
-    <span class="owner-bar-actions">
-      <button id="publish-btn" class="btn btn-dark btn-sm hidden">Publish to team</button>
-      <button id="settings-btn" class="btn btn-outline-dark btn-sm">Settings</button>
-      <button id="lock-btn" class="btn btn-outline-dark btn-sm">Lock</button>
-    </span>
+  <!-- main -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn nav-back hidden" id="back-btn" aria-label="Back">
+        <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+      <h1 class="topbar-title" id="topbar-title">Today</h1>
+      <div class="topbar-search">
+        <svg class="search-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input type="search" id="search" placeholder="Search clients, tasks, people…" autocomplete="off">
+        <kbd class="search-kbd">/</kbd>
+      </div>
+      <div class="topbar-right">
+        <button class="icon-btn only-mobile" id="search-btn" aria-label="Search">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        </button>
+        <div class="who-wrap" id="who-wrap"></div>
+        <button class="btn btn-ghost-line btn-sm" id="owner-btn">Owner login</button>
+      </div>
+    </header>
+
+    <div id="owner-bar" class="owner-bar hidden">
+      <span class="owner-bar-text"><span class="live-dot"></span><span id="owner-bar-label">Owner mode — changes save live for the team.</span></span>
+      <span class="owner-bar-actions">
+        <button class="btn btn-dark btn-sm" id="settings-btn">Settings</button>
+        <button class="btn btn-ghost-dark btn-sm" id="lock-btn">Lock</button>
+      </span>
+    </div>
+
+    <main class="content" id="content">
+      <div class="skeleton-wrap" id="skeleton">
+        <div class="sk sk-title"></div>
+        <div class="sk-row"><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div></div>
+        <div class="sk sk-bar"></div><div class="sk sk-bar"></div>
+        <div class="sk sk-card"></div><div class="sk sk-card"></div>
+      </div>
+      <section id="view" class="view hidden"></section>
+    </main>
   </div>
 
-  <main class="wrap">
-    <section id="view-today" class="view"></section>
-    <section id="view-clients" class="view hidden"></section>
-    <section id="view-team" class="view hidden"></section>
-    <section id="view-schedule" class="view hidden"></section>
-    <section id="view-links" class="view hidden"></section>
-  </main>
-
-  <footer class="foot">
-    <span class="logo-mark tiny">cl<span class="dot">.</span></span>
-    Claude &amp; Co. LLC · made with love (and good light) ✳
-  </footer>
+  <button class="fab hidden" id="fab" aria-label="New task">
+    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
 </div>
 
-<!-- ======= MODAL ======= -->
+<!-- ============ SEARCH OVERLAY (mobile) ============ -->
+<div id="search-overlay" class="search-overlay hidden">
+  <div class="search-overlay-bar">
+    <svg class="search-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+    <input type="search" id="search-mobile" placeholder="Search…" autocomplete="off">
+    <button class="btn btn-ghost btn-sm" id="search-close">Cancel</button>
+  </div>
+  <div id="search-results" class="search-results"></div>
+</div>
+
+<!-- ============ MODAL ============ -->
 <div id="modal-backdrop" class="modal-backdrop hidden">
-  <div id="modal" class="modal"></div>
+  <div id="modal" class="modal" role="dialog" aria-modal="true"></div>
 </div>
+
+<div id="toast-host" class="toast-host"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script src="assets/config.js"></script>

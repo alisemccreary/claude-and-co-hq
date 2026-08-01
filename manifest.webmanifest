@@ -1,0 +1,15 @@
+{
+  "name": "Claude & Co. Studio HQ",
+  "short_name": "Studio HQ",
+  "description": "Client projects, tasks and shoots for the Claude & Co. team.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#2f4739",
+  "theme_color": "#2f4739",
+  "icons": [
+    { "src": "assets/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
