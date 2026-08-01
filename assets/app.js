@@ -510,6 +510,8 @@
       $("view").querySelectorAll("[data-approve-week]").forEach(function (b) {
         b.addEventListener("click", function () { setWeekStatus(b.getAttribute("data-approve-week"), "approved"); });
       });
+      var ex = $("view").querySelector("[data-export]");
+      if (ex) ex.addEventListener("click", exportTimesheet);
       var sub = $("view").querySelector("[data-submit-week]");
       if (sub) sub.addEventListener("click", function () { setWeekStatus(viewerId(), "submitted"); });
     }
@@ -523,6 +525,23 @@
     var prog = pool.filter(function (t) { return t.status === "inprogress"; });
     var shoots = sortT(pool.filter(function (t) { return t.kind === "shoot" && t.status !== "done" && t.due >= td && t.due <= addDays(7); }));
     var pending = DB.timeoff.filter(function (e) { return e.status === "requested"; });
+    var offNow = DB.timeoff.filter(function (e) { return e.status === "approved" && e.start <= td && e.end >= td; });
+    var celebrate = [];
+    DB.members.forEach(function (mm) {
+      var pv = staffFor(mm.id);
+      var bday = (pv && pv.birthday) || sharedVal(mm, "birthday");
+      var start = (pv && pv.startDate) || sharedVal(mm, "startDate");
+      function sameDay(iso) {
+        if (!iso) return false;
+        var d = pDate(iso), n = new Date();
+        return d && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+      }
+      if (sameDay(bday)) celebrate.push({ m: mm, what: "🎂 birthday today" });
+      if (sameDay(start) && pDate(start).getFullYear() < new Date().getFullYear()) {
+        var yrs = new Date().getFullYear() - pDate(start).getFullYear();
+        celebrate.push({ m: mm, what: "🎉 " + yrs + " year" + (yrs === 1 ? "" : "s") + " with the studio" });
+      }
+    });
     var helpNeeded = sortT(pool.filter(function (t) { return t.status === "needhelp"; }));
 
     var h = '<div class="page-head"><h2>' + greet() + ", " + esc(m ? m.name : "there") + " 🌸</h2>" +
@@ -543,6 +562,16 @@
     h += progCard(m ? m.name : "You", live().filter(function (t) { return t.assigneeId === who; }), who, m);
     h += progCard("The whole team", live(), "team", null);
 
+    if (celebrate.length) {
+      h += celebrate.map(function (c) {
+        return '<div class="banner good">' + avatar(c.m, "sm") + " <b>" + esc(c.m.name) + "</b> — " + c.what + "</div>";
+      }).join("");
+    }
+    if (offNow.length) {
+      h += '<div class="banner">🌴 Out today: <b>' + offNow.map(function (e) {
+        var mm = member(e.memberId); return esc(mm ? mm.name : "?");
+      }).join(", ") + "</b></div>";
+    }
     if (helpNeeded.length) {
       h += '<div class="section"><h3>🙋 Someone needs help</h3></div>' +
         helpNeeded.map(function (t) { return taskHTML(t); }).join("");
@@ -886,6 +915,29 @@
     });
   }
 
+  function exportTimesheet() {
+    var days = weekDays();
+    var head = ["Person", "Rate"].concat(days.map(function (d) { return fPlain(d); })).concat(["Total hours", "Gross pay", "Status"]);
+    var lines = [head.join(",")];
+    DB.members.forEach(function (m) {
+      var priv = staffFor(m.id), rate = priv ? priv.rate : 0, total = 0, st = "";
+      var cells = days.map(function (d) {
+        var e = entryFor(m.id, d);
+        if (e) { total += e.hours; if (e.status === "approved") st = "approved"; else if (!st) st = e.status; }
+        return e ? e.hours : "";
+      });
+      lines.push(['"' + m.full.replace(/"/g, '""') + '"', rate || ""].concat(cells)
+        .concat([Math.round(total * 10) / 10, rate ? (Math.round(total * rate * 100) / 100) : "", st]).join(","));
+    });
+    var blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "timesheet-" + days[0] + ".csv";
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 400);
+    toast("Timesheet downloaded — hand it straight to payroll");
+  }
+
   function viewTimesheet() {
     var owner = isOwner();
     var days = weekDays();
@@ -897,6 +949,7 @@
       '<b>' + label + (weekOffset === 0 ? " · this week" : "") + "</b>" +
       '<button class="btn btn-soft btn-sm" data-week="1">Next ›</button>' +
       (weekOffset !== 0 ? '<button class="btn btn-ghost btn-sm" data-week="0">Today</button>' : "") +
+      (owner ? '<button class="btn btn-soft btn-sm" data-export style="margin-left:auto">⬇ Export CSV</button>' : "") +
       "</div>";
 
     h += '<div class="tswrap"><div class="ts">';
@@ -1965,39 +2018,6 @@
   $("gate-input").addEventListener("keydown", function (e) { if (e.key === "Enter") tryGate(); });
 
   /* ══════════ boot ══════════ */
-  var QA = location.search.indexOf("qa=") >= 0;
-  function qaSetup() {
-    if (!QA) return;
-    var role = /qa=owner/.test(location.search) ? "owner" : "employee";
-    var mid = (location.search.match(/who=([a-z0-9]+)/) || [])[1] || (role === "owner" ? "alise" : "hannah");
-    me = { userId: "qa", memberId: mid, role: role };
-    who = mid;
-    DB.staff = DB.members.map(function (m, i) {
-      return { memberId: m.id, rate: [0,23,20,18][i%4], payType: "hourly", phone: "662-555-010"+i,
-        address: "Oxford, MS", emName: "Kin of "+m.name, emPhone: "662-555-9999",
-        startDate: "2025-03-01", birthday: "1998-06-02", notes: "QA", title: ["Owner","Content lead","Scheduler","Outreach"][i%4],
-        weeklyHours: 20, share: { title: true, bio: true, email: i % 2 === 0 } };
-    });
-    DB.members.forEach(function (m, i) {
-      m.shared = { title: ["Owner","Content lead","Scheduler","Outreach"][i%4], bio: m.info };
-      if (i % 2 === 0) m.shared.email = m.email;
-    });
-    DB.hours = DB.tasks.map(function (t,i) { return { taskId: t.id, assigneeId: t.assigneeId, hours: [1,2.5,4,3][i%4] }; });
-    var base = new Date(); var back = (base.getDay()+6)%7;
-    function d(o){ var x=new Date(); x.setDate(x.getDate()-back+o); return x.getFullYear()+"-"+String(x.getMonth()+1).padStart(2,"0")+"-"+String(x.getDate()).padStart(2,"0"); }
-    DB.time = [
-      { id:"e1", memberId:"hannah", date:d(0), hours:4, note:"", status:"draft" },
-      { id:"e2", memberId:"hannah", date:d(1), hours:6.5, note:"", status:"draft" },
-      { id:"e3", memberId:"brailey", date:d(1), hours:3, note:"", status:"submitted" },
-      { id:"e4", memberId:"maddie", date:d(2), hours:5, note:"", status:"approved" }
-    ];
-    if (role === "employee") {
-      DB.staff = DB.staff.filter(function (x) { return x.memberId === mid; });
-      DB.hours = DB.hours.filter(function (x) { return x.assigneeId === mid; });
-      DB.time  = DB.time.filter(function (x) { return x.memberId === mid; });
-    }
-  }
-
   function boot() {
     if (gateOK()) hideGate(); else showGate();
     Promise.resolve()
@@ -2007,7 +2027,6 @@
         loaded = true;
         if (!DB.members.length) seedFromFile();
         if (me.memberId) who = me.memberId;
-        qaSetup();
         if (!view) view = isOwner() ? "today" : "mywork";
         paintConnection();
         render();
