@@ -732,8 +732,8 @@
   function loginState(m) {
     var has = DB.logins.filter(function (u) { return u.member_id === m.id; }).length > 0;
     if (has) return { key: "active", label: "Has a login", why: "They can sign in and update their own work." };
-    if (!m.email) return { key: "noemail", label: "Add an email first", why: "A login needs an email address on their profile." };
-    return { key: "none", label: "No login yet", why: "They can read the studio but can't tick off their own tasks." };
+    if (!m.email) return { key: "noemail", label: "Add an email first", why: "A login is matched by email, so they need one on their profile." };
+    return { key: "none", label: "No login yet", why: "Create one in Supabase using " + m.email + " and they're in." };
   }
   function profileCompleteness(m) {
     var x = staffFor(m.id) || {};
@@ -1592,20 +1592,21 @@
 
   function loginHelp(m) {
     var email = m.email || "their email";
+    var hasEmail = !!m.email;
     openModal("<h3>Give " + esc(m.name) + " a login</h3>" +
-      "<div class='modal-sub'>Two minutes, and then they can tick off their own tasks and see their own hours.</div>" +
+      "<div class='modal-sub'>About a minute. Studio HQ recognises them by their email address, so there's nothing to configure afterwards.</div>" +
+      (hasEmail ? "" : "<div class='banner warn'>Add an email to " + esc(m.name) +
+        "'s profile first — that's how the login is matched to them.</div>") +
       "<ol class='steps'>" +
-      "<li>Open <b>supabase.com/dashboard</b> → your <b>studio-hq</b> project → <b>Authentication</b> → <b>Users</b>.</li>" +
-      "<li>Click <b>Add user → Create new user</b>. Email: <b>" + esc(email) + "</b>. Pick a password and tick <b>Auto Confirm User</b>.</li>" +
-      "<li>Go to <b>SQL Editor</b>, paste the line below, press Run.</li>" +
-      "<li>Send " + esc(m.name) + " the password — they sign in with <b>Owner login</b> and get their own screen.</li></ol>" +
-      "<label>Paste this into the SQL editor</label>" +
-      "<textarea id='lh-sql' readonly rows='3' style='font-family:ui-monospace,monospace;font-size:12.5px'>insert into app_users (user_id, member_id, role)\nselect id, '" + esc(m.id) + "', 'employee' from auth.users where email = '" + esc(email) + "'\non conflict (user_id) do update set member_id = '" + esc(m.id) + "', role = 'employee';</textarea>" +
+      "<li>Open <b>supabase.com/dashboard</b> → <b>studio-hq</b> → <b>Authentication</b> → <b>Users</b>.</li>" +
+      "<li><b>Add user → Create new user</b>. Use exactly <b>" + esc(email) + "</b>, choose a password, and tick <b>Auto Confirm User</b>.</li>" +
+      "<li>Send " + esc(m.name) + " that password. They open Studio HQ, tap <b>Owner login</b>, and land on their own screen.</li>" +
+      "</ol>" +
+      "<div class='hint'>They'll see their own tasks, hours and pay — and nobody else's.</div>" +
       "<div class='modal-actions'><button class='btn btn-soft' data-close>Close</button>" +
-      "<button class='btn btn-primary' id='lh-copy'>Copy the SQL</button></div>");
-    $("lh-copy").addEventListener("click", function () {
-      var ta = $("lh-sql"); ta.select();
-      try { document.execCommand("copy"); toast("Copied — paste it into Supabase"); } catch (e) { toast("Select and copy the text", true); }
+      "<button class='btn btn-primary' id='lh-open'>Open Supabase</button></div>");
+    $("lh-open").addEventListener("click", function () {
+      window.open("https://supabase.com/dashboard/project/agwjsxfczbcuewnxehrr/auth/users", "_blank", "noopener");
     });
   }
 
@@ -2064,7 +2065,13 @@
       if (!u) { me = { userId: null, memberId: null, role: null }; return; }
       me.userId = u.id;
       return sb.from("app_users").select("member_id,role").eq("user_id", u.id).maybeSingle().then(function (res) {
-        if (res.data) { me.memberId = res.data.member_id; me.role = res.data.role; who = me.memberId || who; }
+        if (res.data) { me.memberId = res.data.member_id; me.role = res.data.role; who = me.memberId || who; return; }
+        // No explicit mapping: match them to a teammate by email, the same
+        // rule the database uses. Owner still requires an app_users row.
+        var mine = DB.members.filter(function (m) {
+          return m.email && u.email && m.email.toLowerCase() === u.email.toLowerCase();
+        })[0];
+        if (mine) { me.memberId = mine.id; me.role = "employee"; who = mine.id; }
         else { me.memberId = null; me.role = null; }
       });
     });
