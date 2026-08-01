@@ -28,7 +28,7 @@
 
   /* ── local mirror of the database ── */
   var DB = { members: [], clients: [], tasks: [], links: [], timeoff: [], comments: [], activity: [], settings: {},
-             hours: [], staff: [], time: [] };  // hours/staff/time are private: the server only sends what you may see
+             hours: [], staff: [], time: [], logins: [] };  // hours/staff/time are private: the server only sends what you may see
   var me = { userId: null, memberId: null, role: null };
   var who = localStorage.getItem(LS_WHO) || "alise";
   var view = null;   // resolved at boot: owners land on Today, the team on My work
@@ -94,11 +94,16 @@
   function isMine(t) { return t.assigneeId === viewerId(); }
   function statusLabel(s) { return s === "archived" ? "past client" : s; }
 
-  function toast(msg, bad) {
-    var t = el('<div class="toast' + (bad ? " bad" : "") + '">' + esc(msg) + "</div>");
+  function toast(msg, bad, action) {
+    var t = el('<div class="toast' + (bad ? " bad" : "") + '"><span>' + esc(msg) + "</span>" +
+      (action ? '<button class="toast-act">' + esc(action.label) + "</button>" : "") + "</div>");
     $("toast-host").appendChild(t);
-    setTimeout(function () { t.style.opacity = "0"; t.style.transition = "opacity .3s"; }, 2600);
-    setTimeout(function () { t.remove(); }, 3000);
+    var life = action ? 8000 : 2600;
+    var t1 = setTimeout(function () { t.style.opacity = "0"; t.style.transition = "opacity .3s"; }, life);
+    var t2 = setTimeout(function () { t.remove(); }, life + 400);
+    if (action) t.querySelector(".toast-act").addEventListener("click", function () {
+      clearTimeout(t1); clearTimeout(t2); t.remove(); action.run();
+    });
   }
   function greet() { var h = new Date().getHours(); return h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening"; }
 
@@ -212,7 +217,8 @@
       sb.from("settings").select("data").eq("id", 1).maybeSingle(),
       sb.from("task_hours").select("*"),
       sb.from("staff_private").select("*"),
-      sb.from("time_entries").select("*").order("work_date", { ascending: false })
+      sb.from("time_entries").select("*").order("work_date", { ascending: false }),
+      sb.from("app_users").select("member_id,role")
     ]).then(function (r) {
       if (r[0].error) { connected = false; seedFromFile(); return; }
       connected = true;
@@ -228,6 +234,7 @@
       DB.hours = (r[8] && !r[8].error && r[8].data ? r[8].data : []).map(mHours);
       DB.staff = (r[9] && !r[9].error && r[9].data ? r[9].data : []).map(mStaff);
       DB.time  = (r[10] && !r[10].error && r[10].data ? r[10].data : []).map(mTime);
+      DB.logins = (r[11] && !r[11].error && r[11].data ? r[11].data : []);
     }).catch(function () { connected = false; seedFromFile(); });
   }
   function seedFromFile() {
@@ -396,7 +403,7 @@
   /* ══════════ shared bits ══════════ */
   function avatar(m, cls) {
     if (!m) return '<span class="avatar sm" style="background:#c9c2bf">?</span>';
-    return '<span class="avatar ' + (cls || "") + '" style="background:' + esc(m.color) + '" title="' + esc(m.full) + '">' + esc(m.name.slice(0, 2).toUpperCase()) + "</span>";
+    return '<span class="avatar ' + (cls || "") + '" role="img" aria-label="' + esc(m.full) + '" title="' + esc(m.full) + '" style="background:' + esc(m.color) + '">' + esc(m.name.slice(0, 2).toUpperCase()) + "</span>";
   }
   function progCard(label, list, scope, m) {
     var p = pct(list);
@@ -587,7 +594,7 @@
     h += '<div class="section" id="due"><h3>Today, client by client</h3></div>';
     var todays = sortT(pool.filter(function (t) { return t.due === td; }));
     if (!todays.length) {
-      h += '<div class="empty"><span class="big">🌿</span>Nothing due today' + (mineOnly ? " for you" : "") + ". Enjoy it.</div>";
+      h += '<div class="empty"><span class="big">🌿</span><b>A clear day</b><span>Nothing is due today' + (mineOnly ? " for you" : "") + ". Anything due today lands here.</span></div>";
     } else {
       var by = {};
       todays.forEach(function (t) { (by[t.clientId] = by[t.clientId] || []).push(t); });
@@ -666,7 +673,7 @@
         '<span class="col-dot" style="background:' + STATUS[col.id].color + '"></span><h4>' + col.label + "</h4>" +
         '<span class="col-count">' + items.length + "</span></div>";
       h += items.map(bcardHTML).join("");
-      if (!items.length) h += '<div class="empty" style="padding:16px 10px;margin:0">Nothing here</div>';
+      if (!items.length) h += '<div class="empty" style="padding:16px 10px;margin:0">Nothing in this column</div>';
       if (isOwner() && col.id === "todo") h += quickAdd("Add a task…", "");
       h += "</div>";
     });
@@ -717,6 +724,18 @@
     { k: "startDate", label: "Start date" },
     { k: "birthday",  label: "Birthday" }
   ];
+  function loginState(m) {
+    var has = DB.logins.filter(function (u) { return u.member_id === m.id; }).length > 0;
+    if (has) return { key: "active", label: "Has a login", why: "They can sign in and update their own work." };
+    if (!m.email) return { key: "noemail", label: "Add an email first", why: "A login needs an email address on their profile." };
+    return { key: "none", label: "No login yet", why: "They can read the studio but can't tick off their own tasks." };
+  }
+  function profileCompleteness(m) {
+    var x = staffFor(m.id) || {};
+    var checks = [!!m.full, !!m.email, !!x.title, !!x.phone, !!x.startDate, !!x.rate, !!x.emName];
+    var done = checks.filter(Boolean).length;
+    return { done: done, total: checks.length, pct: Math.round(done / checks.length * 100) };
+  }
   function sharedVal(m, key) {
     var sh = m.shared || {};
     return sh[key] == null || sh[key] === "" ? null : sh[key];
@@ -738,7 +757,8 @@
       add("Email", sharedVal(m, "email"));
       add("Phone", sharedVal(m, "phone"));
       add("Started", sharedVal(m, "startDate") ? fDate(sharedVal(m, "startDate")) : null);
-      add("Birthday", sharedVal(m, "birthday") ? fDate(sharedVal(m, "birthday")) : null);
+      var b = sharedVal(m, "birthday");
+      add("Birthday", b ? new Date(2000, +b.slice(0, 2) - 1, +b.slice(3)).toLocaleDateString("en-US", { month: "long", day: "numeric" }) : null);
     }
     return out;
   }
@@ -771,6 +791,7 @@
         '<div class="person-role">' + esc(title || "—") + "</div></div></div>" +
         (m.email ? '<div class="person-line">✉ ' + esc(m.email) + "</div>" : "") +
         '<div class="person-tags">' +
+          (isOwner() ? '<span class="pill login-' + loginState(m).key + '">' + loginState(m).label + "</span>" : "") +
           (off ? '<span class="pill approved">🌴 off today</span>' : "") +
           (help ? '<span class="pill needhelp">' + help + " need help</span>" : "") +
           '<span class="pill todo">' + open + " open</span>" +
@@ -780,7 +801,7 @@
     h += '<div class="section"><h3>Time off</h3><div class="section-actions">' +
       (isOwner() ? '<button class="btn btn-dark btn-sm" data-addoff>' + ICON.plus + " Add</button>"
                  : '<button class="btn btn-dark btn-sm" data-reqoff>🌴 Request time off</button>') + "</div></div>";
-    h += upcoming.length ? upcoming.map(offHTML).join("") : '<div class="empty">No time off coming up.</div>';
+    h += upcoming.length ? upcoming.map(offHTML).join("") : '<div class="empty"><b>Full house</b><span>Nobody is booked off. Approved time off shows up here.</span></div>';
 
     if (DB.activity.length) {
       h += '<div class="section"><h3>Recent activity</h3></div><div class="card">';
@@ -825,7 +846,7 @@
       '<button data-mine="0" class="' + (mineOnly ? "" : "on") + '">Everyone</button>' +
       '<button data-mine="1" class="' + (mineOnly ? "on" : "") + '">Just ' + esc(m ? m.name : "me") + "</button></div>";
     if (isOwner()) h += '<div class="section-actions" style="margin-bottom:14px"><button class="btn btn-dark btn-sm" data-newshoot>📷 Schedule a shoot</button></div>';
-    if (!keys.length) h += '<div class="empty"><span class="big">🗓</span>Nothing on the calendar yet.</div>';
+    if (!keys.length) h += '<div class="empty"><span class="big">🗓</span><b>Plan the week ahead</b><span>Shoots, deadlines and approved time off appear here.</span></div>';
     keys.forEach(function (d) {
       h += '<div class="day"><div class="day-head"><b>' + fDow(d) + "</b><span>" + fDate(d) + "</span>" +
         (d === td ? '<span class="today-tag">today</span>' : "") + "</div>" +
@@ -903,15 +924,18 @@
     var days = weekDays();
     var mine = DB.time.filter(function (e) { return e.memberId === mid && days.indexOf(e.date) >= 0; });
     if (!mine.length) return toast("No hours logged that week", true);
-    mine.forEach(function (e) { e.status = status; });
-    scheduleRender();
-    if (!cloudReady) return;
+    if (!cloudReady) { mine.forEach(function (e) { e.status = status; }); scheduleRender(); return; }
+    // Deliberately NOT optimistic: a pay-affecting approval must not look
+    // successful before the server has actually accepted it.
     Promise.all(mine.map(function (e) {
       return sb.from("time_entries").update({ status: status }).eq("id", e.id).select("id");
     })).then(function (res) {
       var bad = res.filter(function (r) { return r.error || !r.data || !r.data.length; }).length;
-      if (bad) { fail("Couldn't update the timesheet"); loadAll().then(render); }
-      else toast(status === "approved" ? "Timesheet approved ✓" : status === "submitted" ? "Sent to Alise ✓" : "Reopened");
+      if (bad) { fail("Couldn't update the timesheet — try signing in again"); loadAll().then(render); return; }
+      mine.forEach(function (e) { e.status = status; });
+      scheduleRender();
+      var mm = member(mid);
+      toast(status === "approved" ? "Approved " + (mm ? mm.name : "") + "'s week" : "Sent to Alise for approval");
     });
   }
 
@@ -1203,8 +1227,14 @@
       toast(isNew ? "Assigned to " + (am ? am.name : "the team") + " ✳" : "Saved ✳");
     });
     if (!isNew) $("f-del").addEventListener("click", function () {
-      if (!confirm("Delete this task?")) return;
-      closeModal(); removeRow("tasks", t.id, "tasks"); logAct("deleted", t.title); toast("Deleted");
+      var snap = JSON.parse(JSON.stringify(task(t.id) || t));
+      closeModal();
+      removeRow("tasks", t.id, "tasks");
+      logAct("deleted", snap.title);
+      toast("Deleted \u201C" + snap.title + "\u201D", false, {
+        label: "Undo",
+        run: function () { upsert("tasks", taskRow(snap), snap, "tasks"); toast("Task restored"); }
+      });
     });
   }
 
@@ -1366,6 +1396,16 @@
       h += "<div class='hint'>No contact details shared.</div>";
     }
 
+    if (isOwner()) {
+      var comp = profileCompleteness(m), ls = loginState(m);
+      h += "<label>Profile</label>" +
+        '<div class="prog-card" style="margin-bottom:8px"><div class="prog-top">' +
+        '<span class="prog-name">' + comp.done + " of " + comp.total + " details filled in</span>" +
+        '<span class="prog-pct' + (comp.pct === 100 ? " full" : "") + '">' + comp.pct + "%</span></div>" +
+        '<div class="bar"><div class="bar-fill' + (comp.pct === 100 ? " full" : "") + '" style="width:' + comp.pct + '%"></div></div></div>' +
+        '<div class="login-note login-' + ls.key + '"><b>' + esc(ls.label) + "</b> " + esc(ls.why) +
+        (ls.key !== "active" ? ' <button class="linkish" id="p-login">Set one up</button>' : "") + "</div>";
+    }
     if (isOwner() || self) {
       var r = payRows().filter(function (q) { return q.m.id === id; })[0];
       var logged = DB.time.filter(function (e) { return e.memberId === id; })
@@ -1393,6 +1433,7 @@
     var a = $("p-assign"); if (a) a.addEventListener("click", function () { taskForm(null, { assigneeId: id }); });
     var e = $("p-edit");   if (e) e.addEventListener("click", function () { profileEdit(id); });
     var hr = $("p-hr");    if (hr) hr.addEventListener("click", function () { hrFile(id); });
+    var lg = $("p-login");  if (lg) lg.addEventListener("click", function () { loginHelp(m); });
   }
 
   /* ── Owner-only profile editor with per-field sharing ── */
@@ -1463,6 +1504,8 @@
       var vals = { title: x.title, bio: m.info, email: m.email, phone: x.phone, startDate: x.startDate, birthday: x.birthday };
       var pub = {};
       SHAREABLE.forEach(function (f) { if (share[f.k] && vals[f.k]) pub[f.k] = vals[f.k]; });
+      // Birthdays are shared as month + day only — the year is never published.
+      if (pub.birthday) pub.birthday = String(pub.birthday).slice(5);
       m.shared = pub;
       if (!share.email) m.email = m.email;   // email stays on members for the owner's own use
 
@@ -1582,8 +1625,13 @@
       if (wasNew && isOwner()) setTimeout(function () { loginHelp(m); }, 400);
     });
     var d = $("m-del"); if (d) d.addEventListener("click", function () {
-      if (!confirm("Remove " + m.name + "?")) return;
-      closeModal(); removeRow("members", m.id, "members"); toast("Removed");
+      var openN = live().filter(function (t) { return t.assigneeId === m.id && t.status !== "done"; }).length;
+      var hrs = DB.time.filter(function (e) { return e.memberId === m.id; }).reduce(function (a, e) { return a + e.hours; }, 0);
+      var bits = [];
+      if (openN) bits.push(openN + " open task" + (openN === 1 ? "" : "s") + " will be left unassigned");
+      if (hrs) bits.push((Math.round(hrs * 10) / 10) + " logged hours stay in your payroll records");
+      if (!confirm("Remove " + m.full + " from the studio?" + (bits.length ? "\n\n" + bits.join(".\n") + "." : "") + "\n\nThis can't be undone.")) return;
+      closeModal(); removeRow("members", m.id, "members"); toast(m.name + " removed from the studio");
     });
   }
   function linkForm(id) {

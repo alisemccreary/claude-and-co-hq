@@ -935,3 +935,22 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
   .deets { grid-template-columns: 1fr; }
   .people { grid-template-columns: 1fr; }
 }
+
+/* empty states: outcome-first title + one supporting line (Carbon/Polaris/Vibe) */
+.empty b { display: block; font-size: 14.5px; color: var(--ink); margin-bottom: 3px; font-weight: 700; }
+.empty span:not(.big) { display: block; font-size: 13px; color: var(--muted); line-height: 1.5; max-width: 42ch; margin: 0 auto; }
+.toast { gap: 12px; }
+.toast-act {
+  background: rgba(255,255,255,.16); border: none; cursor: pointer;
+  color: #fff; font-weight: 800; font-size: 12.5px; letter-spacing: .04em;
+  text-transform: uppercase; border-radius: 999px; padding: 5px 12px;
+}
+.toast-act:hover { background: rgba(255,255,255,.28); }
+.login-note {
+  font-size: 12.5px; color: var(--ink-2); background: var(--surface-2);
+  border-radius: var(--r-sm); padding: 9px 11px; margin-top: 4px; line-height: 1.5;
+}
+.login-note b { color: var(--ink); }
+.pill.login-active { background: var(--done-bg); color: var(--done); }
+.pill.login-none   { background: var(--prog-bg); color: var(--prog); }
+.pill.login-noemail{ background: var(--surface-2); color: var(--muted); }
