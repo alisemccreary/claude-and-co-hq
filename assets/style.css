@@ -705,7 +705,12 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
   .topbar-title { font-size: 18px; }
   .topbar-search { display: none; }
   .only-mobile { display: inline-flex; }
-  .owner-bar { padding: 8px 15px; font-size: 12.5px; }
+  .owner-bar { padding: 7px 15px; font-size: 12px; flex-wrap: nowrap; gap: 8px; }
+  .owner-bar-text { min-width: 0; overflow: hidden; }
+  .owner-bar-text #owner-bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .owner-bar .btn-sm { padding: 5px 10px; font-size: 12px; }
+  /* keep the floating button clear of the last card */
+  .content { padding-bottom: 96px; }
   .content { padding: 18px 15px 40px; }
   .page-head h2 { font-size: 22px; }
   .fab { bottom: calc(var(--bar-h) + 16px + env(safe-area-inset-bottom)); }
@@ -805,3 +810,39 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 }
 .person-head .who-meta { min-width: 0; flex: 1; }
 .person-head h3 { font-size: 17px; }
+
+/* ═══════════ payroll (v4.2) ═══════════ */
+.paytable {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r); box-shadow: var(--sh); overflow: hidden;
+}
+.payhead, .payrow {
+  display: grid; grid-template-columns: 2fr .7fr .7fr .7fr 1fr 1fr;
+  gap: 8px; align-items: center; padding: 11px 15px;
+}
+.payhead {
+  font-size: 10.5px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--muted); background: var(--surface-2); border-bottom: 1px solid var(--line);
+}
+.payrow { border-top: 1px solid var(--line-soft); font-size: 14px; transition: background .13s var(--ease); }
+.payrow:first-of-type { border-top: none; }
+.payrow[data-hr] { cursor: pointer; }
+.payrow[data-hr]:hover { background: var(--surface-2); }
+.payname { display: flex; align-items: center; gap: 9px; font-weight: 600; min-width: 0; }
+.payname span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dim { color: var(--muted); font-style: normal; font-size: 12.5px; }
+.tc-hrs { font-weight: 700; color: var(--ink-2); }
+
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.steps { margin: 6px 0 0; padding-left: 20px; font-size: 13.5px; line-height: 1.6; color: var(--ink-2); }
+.steps li { margin-bottom: 7px; }
+.steps b { color: var(--ink); }
+
+@media (max-width: 899px) {
+  .nav-item.secondary { display: none; }
+  .payhead, .payrow { grid-template-columns: 1.6fr .6fr .6fr 1fr; }
+  .payhead span:nth-child(4), .payrow span:nth-child(4),
+  .payhead span:nth-child(5), .payrow span:nth-child(5) { display: none; }
+  .row2 { grid-template-columns: 1fr; }
+}
+@media (min-width: 900px) { .nav-more { display: none; } }
